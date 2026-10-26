@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#
+# worktree-orchard-salvage: save what removing a worktree would destroy, into
+# the main checkout.
+#
+#   worktree-orchard-salvage [--check | --block] [<tree>]
+#
+# Removing a worktree deletes three kinds of work that exist nowhere else:
+# uncommitted changes, commits no remote has, and gitignored files. This copies
+# the three into <main checkout>/tmp/salvage/<tree>-<time>/ and pins unpushed
+# commits under refs/salvage/ in the main repository, so gc cannot collect
+# them. It deletes nothing and pushes nothing.
+#
+# The gitignored files saved are the ones a session would miss: whatever the
+# salvage_keep setting names (for example "HANDOFF.md tmp"), and whatever
+# .worktreeinclude names unless that copy is identical to the main checkout's.
+# Build output and dependency folders are left alone on purpose.
+#
+# Modes:
+#   (none)    save, and exit 0 even when the tree holds unsafe work. For a tool
+#             that removes the tree whatever this returns, such as emdash.
+#   --block   save, then exit 1 if the tree has uncommitted changes or unpushed
+#             commits, so the caller keeps the directory: worktree-orchard rm,
+#             or Paseo's worktree teardown.
+#   --check   report only, write nothing; exit 1 on the same condition.
+#
+# Exit codes: 0 safe to remove, 1 unsafe work present, 2 usage or salvage error.
+# <tree> defaults to the current directory. Called from the main working tree,
+# it does nothing.
+#
+# salvage_keep is read from the worktree-orchard config file, or from
+# ORCHARD_SALVAGE_KEEP when that is set, as space-separated paths relative to
+# the tree's root.
+
+set -uo pipefail
+
+PROG=worktree-orchard-salvage
+usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; }
+
+mode=save
+case "${1-}" in
+  --check) mode=check; shift ;;
+  --block) mode=block; shift ;;
+  -h|--help) usage; exit 0 ;;
+  -*) echo "$PROG: unknown option $1" >&2; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "$PROG: one tree at a time" >&2; exit 2; }
+
+tree=$(git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null) \
+  || { echo "$PROG: ${1:-.} is not inside a git worktree" >&2; exit 2; }
+common=$(git -C "$tree" rev-parse --path-format=absolute --git-common-dir) || exit 2
+main=$(dirname "$common")
+if [ "$(cd "$tree" && pwd -P)" = "$(cd "$main" && pwd -P)" ]; then
+  echo "$PROG: $tree is the main working tree; nothing to salvage" >&2
+  exit 0
+fi
+name=$(basename "$tree")
+
+# --- what is at risk ----------------------------------------------------------
+
+# Uncommitted: tracked changes and untracked files git does not ignore.
+changed=$(git -C "$tree" status --porcelain --untracked-files=all | grep -c . || true)
+
+# Unpushed: commits on HEAD that no remote-tracking ref holds. A repository
+# with no remote-tracking refs at all has nothing to compare against, so the
+# check is skipped there rather than calling every commit unpushed.
+unpushed=0
+if git -C "$tree" rev-parse --verify -q HEAD >/dev/null \
+   && [ -n "$(git -C "$tree" for-each-ref --count=1 refs/remotes)" ]; then
+  unpushed=$(git -C "$tree" rev-list --count HEAD --not --remotes)
+fi
+
+# What salvage_keep names. The environment wins over the config file, so the
+# caller can pass the value it already read.
+if [ -n "${ORCHARD_SALVAGE_KEEP+set}" ]; then
+  keep_list=$ORCHARD_SALVAGE_KEEP
+else
+  keep_list=""
+  conf="${ORCHARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/worktree-orchard/config}"
+  [ -f "$conf" ] && keep_list=$(awk '
+    /^[[:space:]]*salvage_keep[[:space:]]*=/ {
+      v = substr($0, index($0, "=") + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v) }
+    END { print v }' "$conf")
+fi
+# True when $1 is a salvage_keep path or sits under one.
+in_keep_list() {
+  local k
+  for k in $keep_list; do
+    k=${k%/}
+    case "$1" in "$k"|"$k"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Gitignored files worth keeping, NUL-separated into $WORK/rescue.
+WORK=$(mktemp -d) || exit 2
+trap 'rm -rf "$WORK"' EXIT
+: > "$WORK/rescue"
+# git reports a nested repository or worktree as a directory entry ending in /;
+# those are skipped rather than copied whole.
+keep() { case "$1" in */|'') ;; *) [ -f "$tree/$1" ] && printf '%s\0' "$1" >> "$WORK/rescue" ;; esac; }
+# An empty pathspec would list every ignored file in the tree, so an empty
+# salvage_keep skips the query instead.
+if [ -n "${keep_list// /}" ]; then
+  # Unquoted on purpose: salvage_keep is a list of paths.
+  # shellcheck disable=SC2086
+  while IFS= read -r -d '' f; do keep "$f"; done < <(
+    git -C "$tree" ls-files -z --others --ignored --exclude-standard -- $keep_list 2>/dev/null)
+fi
+inc="$tree/.worktreeinclude"; [ -f "$inc" ] || inc="$main/.worktreeinclude"
+if [ -f "$inc" ]; then
+  while IFS= read -r -d '' f; do
+    in_keep_list "$f" && continue
+    # .worktreeinclude files were copied in from the main checkout, so an
+    # unchanged one is already safe there.
+    cmp -s "$tree/$f" "$main/$f" 2>/dev/null && continue
+    keep "$f"
+  done < <(git -C "$tree" ls-files -z --others --ignored --exclude-from="$inc" 2>/dev/null \
+             | git -C "$tree" check-ignore -z --stdin 2>/dev/null)
+fi
+rescued=$(tr -cd '\0' < "$WORK/rescue" | wc -c | tr -d ' ')
+
+unsafe=0; [ "$changed" -gt 0 ] || [ "$unpushed" -gt 0 ] && unsafe=1
+say_unsafe() {
+  local what=""
+  [ "$changed" -gt 0 ] && what="$changed uncommitted change(s)"
+  [ "$unpushed" -gt 0 ] && what="${what:+$what and }$unpushed unpushed commit(s)"
+  printf '%s' "$what"
+}
+
+if [ "$mode" = check ]; then
+  [ "$changed" -gt 0 ] && echo "uncommitted: $changed path(s)"
+  [ "$unpushed" -gt 0 ] && echo "unpushed:    $unpushed commit(s)"
+  [ "$rescued" -gt 0 ] && echo "would save:  $rescued gitignored file(s)"
+  [ "$unsafe" = 0 ] && [ "$rescued" = 0 ] && echo "$name: nothing at risk"
+  exit "$unsafe"
+fi
+
+if [ "$unsafe" = 0 ] && [ "$rescued" = 0 ]; then
+  echo "$PROG: $name has nothing at risk" >&2
+  exit 0
+fi
+
+# --- save ---------------------------------------------------------------------
+
+fail() { echo "$PROG: $1; do not remove $tree" >&2; exit 2; }
+
+# The salvage directory must never be committable from the main checkout. Where
+# the repo does not already ignore it, the local-only exclude file does.
+if ! git -C "$main" check-ignore -q tmp/salvage/probe 2>/dev/null; then
+  mkdir -p "$common/info" && printf '/tmp/salvage/\n' >> "$common/info/exclude" \
+    || fail "could not exclude tmp/salvage/ in $main"
+fi
+
+stamp=$(date +%Y%m%d-%H%M%S)
+dest="$main/tmp/salvage/$name-$stamp"
+[ -e "$dest" ] && dest="$dest-$$"
+mkdir -p "$dest" || fail "could not create $dest"
+
+if [ "$changed" -gt 0 ]; then
+  if git -C "$tree" rev-parse --verify -q HEAD >/dev/null; then
+    git -C "$tree" diff --binary HEAD > "$dest/changes.patch" || fail "could not write the patch"
+    [ -s "$dest/changes.patch" ] || rm -f "$dest/changes.patch"
+  fi
+  while IFS= read -r -d '' f; do
+    mkdir -p "$dest/untracked/$(dirname "$f")" && cp -p "$tree/$f" "$dest/untracked/$f" \
+      || fail "could not copy untracked $f"
+  done < <(git -C "$tree" ls-files -z --others --exclude-standard)
+fi
+
+while IFS= read -r -d '' f; do
+  mkdir -p "$dest/files/$(dirname "$f")" && cp -p "$tree/$f" "$dest/files/$f" \
+    || fail "could not copy $f"
+done < "$WORK/rescue"
+
+ref=""
+if [ "$unpushed" -gt 0 ]; then
+  ref="refs/salvage/$name-$stamp"
+  git -C "$main" update-ref "$ref" "$(git -C "$tree" rev-parse HEAD)" || fail "could not pin HEAD as $ref"
+  git -C "$tree" log --oneline HEAD --not --remotes > "$dest/unpushed.txt"
+fi
+
+{
+  echo "Salvaged from $tree on $(date '+%Y-%m-%d %H:%M %Z')"
+  echo "Branch: $(git -C "$tree" branch --show-current 2>/dev/null || true)"
+  echo "HEAD:   $(git -C "$tree" rev-parse HEAD 2>/dev/null || echo none)"
+  echo
+  [ -f "$dest/changes.patch" ] && echo "changes.patch  tracked changes; restore with: git apply $dest/changes.patch"
+  [ -d "$dest/untracked" ] && echo "untracked/     untracked files, at their paths in the tree"
+  [ -d "$dest/files" ] && echo "files/         gitignored files, at their paths in the tree"
+  [ -n "$ref" ] && echo "unpushed.txt   $unpushed commit(s) no remote has, pinned as $ref; restore with: git switch -c <branch> $ref"
+} > "$dest/SALVAGE.txt"
+
+echo "$PROG: saved $name to $dest" >&2
+if [ "$mode" = block ] && [ "$unsafe" = 1 ]; then
+  echo "$PROG: $name has $(say_unsafe), so it should not be removed yet. Commit and push, then remove it again." >&2
+  exit 1
+fi
+exit 0

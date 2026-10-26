@@ -1,0 +1,35 @@
+# worktree-orchard configuration.
+# Copy to ~/.config/worktree-orchard/config and keep what you need.
+# key = value, one per line. Lines starting with # are comments.
+
+# Where --all looks for repos, one level deep.
+code_root = ~/code
+
+# Where `new` puts trees, relative to the repo's main checkout, and the branch
+# prefix it uses. These defaults match `claude --worktree`.
+worktree_dir = .claude/worktrees
+branch_prefix = worktree-
+
+# Agents. claude and shell are built in; define any others here. The value is
+# a command split on spaces; point it at a script if it needs quoting.
+default_agent = claude
+# alt_agent = aider
+# agent.aider = aider --model sonnet
+
+# auto, always or never. auto uses tmux in an SSH session, or on Linux with no
+# graphical display.
+tmux = auto
+
+# Teardown saves these gitignored paths into the main checkout's tmp/salvage/
+# before a tree is removed, and the preview flags them.
+# salvage_keep = HANDOFF.md tmp
+# salvage = off
+
+# Label trees another tool makes, by a glob over their absolute path.
+# creator.conductor = ~/conductor/workspaces/*
+
+# Hooks run with sh -c; arguments arrive as $1, $2, ...
+# hook.post_create = my-tool register "$1"
+# hook.post_remove = my-tool forget "$1"
+# hook.picker_start = slow-summary > "$1/summary.part" && mv "$1/summary.part" "$1/summary"
+# hook.preview = [ -f "$3/summary" ] && grep -F "$1" "$3/summary"

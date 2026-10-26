@@ -1,0 +1,1846 @@
+#!/usr/bin/env bash
+#
+# worktree-orchard: one view of the git worktrees and tmux sessions you can be
+# working in, with one way to create them and one way to tear them down.
+#
+#   worktree-orchard              # print the table for the current repo
+#   worktree-orchard -i           # pick one and open it; a digit key moves to a row
+#   worktree-orchard -ia          # the same, but a digit key opens its row outright
+#   worktree-orchard 3            # open row 3 of that table, no picker
+#   worktree-orchard --all        # every repo under the code root
+#   worktree-orchard --trees      # worktrees only
+#   worktree-orchard --tmux       # tmux sessions only
+#   worktree-orchard new <name>   # new worktree with an agent in it
+#   worktree-orchard rm <name>    # tear one down by name, whichever tool made it
+#   worktree-orchard salvage ...  # run the bundled salvage step on its own
+#
+# WHY THIS EXISTS. A worktree and its tmux session are usually the same thing
+# seen twice: creating one names the session <repo-folder>_<name>. Listing the
+# trees and listing the sessions separately makes you do that correlation in
+# your head every time, and the answer you actually want, "what can I get back
+# into, and what state is it in", is in neither list on its own. This joins
+# them on that naming convention and shows one row per workspace.
+#
+# It also does not care who created a worktree. Paths come from `git worktree
+# list`, so a tree made by Claude Code, Zed's agent panel, emdash, Paseo,
+# `git worktree add`, or this command all appear and all tear down correctly.
+#
+# Read-only unless you press a key that says otherwise. The four writing keys
+# are n (create), t (create tree only), x (tear down) and r (rename a session).
+# Teardown confirms, refuses a dirty tree, and never deletes a branch.
+#
+# Rows are numbered, and the number is the fast path. The first ten are
+# numbered 1 to 9 and then 0, the way a browser numbers its tabs, so the ten
+# digit keys cover exactly those ten rows and the key you press is the number
+# printed beside the row. Nothing is labelled 10. From the shell, `3` opens
+# the row printed as 3 and `0` opens the tenth. The number is positional in
+# the list as printed, so it moves when the filter or the scope moves.
+#
+# What a digit does in the picker is the whole difference between -i and -ia.
+# Under -i it moves to the row and stops, so a digit is navigation and enter is
+# still the thing that opens. Under -ia ("auto") it opens the row outright.
+#
+# Behaviour is pinned by tests/test-worktree-orchard.sh; change the two together.
+
+set -euo pipefail
+
+# Messages name the command the way it was invoked, so a symlink or wrapper
+# called `wt` reads as wt everywhere, including the help text.
+PROG=${0##*/}
+
+# ---------------------------------------------------------------------------
+# Configuration. Flags beat environment variables, which beat the config
+# file, which beats the defaults below. The file is key = value lines and is
+# parsed, never sourced, so it cannot run code just by being read.
+# ---------------------------------------------------------------------------
+CONFIG_FILE="${ORCHARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/worktree-orchard/config}"
+CONFIG_LINES=""
+if [ -f "$CONFIG_FILE" ]; then
+  CONFIG_LINES=$(awk '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      i = index($0, "=")
+      if (i == 0) { printf "%s\037%s\n", "!bad", NR; next }
+      k = substr($0, 1, i - 1); v = substr($0, i + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      printf "%s\037%s\n", k, v
+    }' "$CONFIG_FILE")
+fi
+
+# cfg KEY [DEFAULT]: the last value the file gives KEY, else DEFAULT.
+cfg() {
+  local k v found="" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    k=${line%%$'\037'*}; v=${line#*$'\037'}
+    [ "$k" = "$1" ] && { found=1; printf -v _cfg_val '%s' "$v"; }
+  done <<<"$CONFIG_LINES"
+  if [ -n "$found" ]; then printf '%s\n' "$_cfg_val"; else printf '%s\n' "${2-}"; fi
+}
+
+# Every key the file defines that starts with PREFIX, one "suffix<US>value" per
+# line, in file order. Used for the agent.* and creator.* tables.
+cfg_prefixed() {  # $1 prefix
+  local line k
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    k=${line%%$'\037'*}
+    case "$k" in "$1"?*) printf '%s\n' "${line#"$1"}" ;; esac
+  done <<<"$CONFIG_LINES"
+}
+
+# A misspelt key would otherwise do nothing with no sign it was read, so an
+# unknown one is named. Only the top-level invocation checks: the picker calls
+# back into this script on every keystroke and would repeat the warning.
+check_config() {
+  local line k
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    k=${line%%$'\037'*}
+    case "$k" in
+      '!bad') echo "$PROG: $CONFIG_FILE line ${line#*$'\037'} has no '=', so it was ignored" >&2 ;;
+      code_root|worktree_dir|branch_prefix|default_agent|alt_agent|tmux|salvage|salvage_keep) ;;
+      hook.post_create|hook.post_remove|hook.picker_start|hook.preview) ;;
+      agent.?*|creator.?*) ;;
+      *) echo "$PROG: unknown key '$k' in $CONFIG_FILE, ignored" >&2 ;;
+    esac
+  done <<<"$CONFIG_LINES"
+}
+
+# The patterns match a literal tilde, which is the point.
+# shellcheck disable=SC2088
+expand_home() { case "$1" in "~") printf '%s\n' "$HOME" ;; "~/"*) printf '%s\n' "$HOME/${1#"~/"}" ;; *) printf '%s\n' "$1" ;; esac; }
+
+SCOPE=repo          # repo | all
+KINDS=both          # both | trees | tmux
+INTERACTIVE=0
+# Whether a digit key opens its row or only moves to it. -i moves, -ia opens.
+DIGIT_OPENS=0
+CODE_ROOT=$(expand_home "${ORCHARD_CODE_ROOT:-$(cfg code_root "$HOME/code")}")
+# Where `new` puts a tree, relative to the repo's main checkout, and the prefix
+# its branch gets. The defaults are the ones `claude --worktree` uses, so trees
+# made by either tool sit side by side.
+WORKTREE_DIR=$(cfg worktree_dir .claude/worktrees)
+WORKTREE_DIR=${WORKTREE_DIR#/}; WORKTREE_DIR=${WORKTREE_DIR%/}
+BRANCH_PREFIX=$(cfg branch_prefix worktree-)
+PREVIEW_MIN_COLS="${ORCHARD_PREVIEW_MIN_COLS:-50}"
+
+# The exact set of keys that stop acting and start typing when you press "/".
+# It lives up here rather than beside the fzf binds because the esc callback
+# below needs to name the same set when it hands the keys back, and two copies
+# of this list would drift the moment a key was added to one of them.
+ACTION_KEYS='j,k,g,G,s,o,n,t,x,r,f,a,p,q,?,/,1,2,3,4,5,6,7,8,9,0'
+
+usage() {
+  # Unquoted on purpose so $PROG and the config path expand. Nothing else in
+  # the text may start with a dollar sign or a backtick.
+  cat <<USAGE
+$PROG: worktrees and tmux sessions, in one list
+
+Usage: $PROG [options]
+       $PROG N
+       $PROG new <name> [--agent NAME | --NAME | --shell | --none]
+              [--tmux | --no-tmux] [-- agent args...]
+       $PROG rm [-f] <name>
+       $PROG salvage [--check | --block] [<tree>]
+
+  -i, --interactive  pick a workspace with fzf and open it. A digit key moves
+                     to that row and stops there; enter is what opens
+  -ia, --interactive-auto
+                     the same picker, except a digit key opens its row
+                     outright, with no second keystroke
+  -a, --all          every repo one level under the code root, not just the
+                     current one. Without it, tmux sessions are limited to this
+                     repo's too: those in its checkout or any of its worktrees,
+                     or named for it
+      --trees        worktrees only
+      --tmux         tmux sessions only
+      --no-color     never colorize
+  -h, --help         this text
+
+  N                  a bare row number from the table opens that row, the same
+                     way enter does in the picker. The tenth row prints as 0,
+                     so it is "$PROG 0". Run $PROG with no arguments first: the
+                     number is the row's position in that list, so it moves
+                     whenever the filter or the scope moves
+
+  new <name>         a new worktree of the current repo at <worktree_dir>/<name>
+                     (default .claude/worktrees/<name>), on a branch named
+                     <branch_prefix><name> (default worktree-<name>), based on
+                     the repo's default branch. Gitignored files listed in the
+                     repo's .worktreeinclude are copied in. Then it opens an
+                     agent there: the default agent, --agent NAME or --NAME for
+                     any agent you defined, --shell, or --none to stop at the
+                     tree. In tmux mode the agent runs in a tmux session named
+                     <repo>_<name>; --tmux and --no-tmux force it either way.
+                     Anything after -- goes to the agent
+  rm [-f] <name>     tear down the worktree of the current repo called <name>,
+                     whichever tool made it. Confirms first, refuses a dirty
+                     tree or unpushed commits, saves gitignored work, and keeps
+                     the branch. -f lifts a worktree lock first, which Claude
+                     Code holds for the life of a session
+  salvage            save what removing a worktree would destroy into the main
+                     checkout's tmp/salvage/. See: $PROG salvage --help
+
+In the picker. It is modal, the way vi is: single keys act, and typing only
+filters once you ask for it with "/". Press ? at any time for the key map.
+
+  1-9 0        go to that numbered row, 0 being the tenth. Under -ia it opens
+               the row as well
+  j k g G      move
+  /            start filtering
+  esc          stop filtering, or quit when you are not filtering
+  enter  o  s  open with the default agent, with alt_agent, or with a shell
+  n t x r      new tree with a session, new tree only, tear down, rename
+  f a p q      cycle the kind filter, toggle --all, toggle the preview, quit
+  ?            the full key map, over the whole terminal. q comes back
+
+Columns:
+
+  #       row number. The first ten rows are numbered 1 to 9 and then 0, so
+          the ten digit keys in the picker cover exactly those rows
+  STATE   ● worktree and session both live
+          ○ worktree with no session
+          ▸ session with no worktree
+          ⌂ the repo's main working tree
+  *       in the leftmost column: the worktree this shell is standing in
+  REPO    which repo the row belongs to. Shown under --all only
+  NAME    worktree name, or session name for a ▸ row
+  GIT     count of uncommitted paths, or clean. MISSING means git still lists
+          the worktree and the directory is gone; UNKNOWN means git status
+          could not be read there, and teardown refuses both
+  SYNC    ahead and behind against the upstream branch, or against the repo's
+          default branch when there is no upstream
+  BY      who made the worktree: orchard, claude, zed, paseo, emdash, git, or
+          a label you defined with creator.<label>
+  AGE     since the session started, or since the worktree directory last
+          changed
+
+Columns are sized to what is in the list. On a narrow terminal each row takes
+two lines. A terminal that is wide enough puts the preview beside the list;
+otherwise it goes underneath.
+
+Configuration lives in $CONFIG_FILE
+as key = value lines. Keys: code_root, worktree_dir, branch_prefix,
+default_agent, alt_agent, agent.<name>, tmux (auto, always, never), salvage
+(on, off), salvage_keep, creator.<label>, and the hooks hook.post_create,
+hook.post_remove, hook.picker_start and hook.preview. The README explains each.
+
+Environment:
+  ORCHARD_CONFIG            another config file
+  ORCHARD_AGENT             the default agent, over default_agent
+  ORCHARD_TMUX              auto, always or never, over tmux
+  ORCHARD_CODE_ROOT         where --all looks for repos, over code_root
+  ORCHARD_PREVIEW_MIN_COLS  narrowest preview worth docking beside the list (50)
+  ORCHARD_STACK_BELOW       width below which each row takes two lines (72)
+  ORCHARD_NO_HOOKS          run none of the configured hooks
+  ORCHARD_PICKER_DRY_RUN    print the fzf command and rows instead of running
+                            it, and refuse every action that would change
+                            anything
+  ORCHARD_NO_HOLD           do not wait for enter after an action in the picker
+  NO_COLOR                  no colour, same as --no-color
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing. The self-dispatch options at the end are how the picker
+# calls back into this script for previews and for the keys that mutate state;
+# they are deliberately undocumented in --help because they are not a UI.
+# ---------------------------------------------------------------------------
+# What an agent name runs. "shell" is your login shell, "claude" is Claude
+# Code unless agent.claude says otherwise, and every other name is whatever
+# agent.<name> in the config file says. The command is split on spaces, so
+# anything that needs quoting belongs in a small script the config points at.
+# Prints nothing for a name that is not defined.
+agent_command() {  # $1 agent name
+  local v
+  case "$1" in shell) printf '%s\n' "${SHELL:-/bin/sh}"; return 0 ;; esac
+  v=$(cfg "agent.$1")
+  if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+  [ "$1" = claude ] && printf 'claude\n'
+  return 0
+}
+agent_known() { [ -n "$(agent_command "$1")" ]; }
+
+# The salvage script ships beside this one. A symlink to this script, which is
+# how most installs put it on PATH, is followed first so the sibling is found
+# in the real install directory. ORCHARD_SALVAGE overrides, for the harness.
+self_dir() {
+  local f=$0 t
+  while [ -L "$f" ]; do
+    t=$(readlink "$f")
+    case "$t" in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac
+  done
+  (cd "$(dirname "$f")" && pwd)
+}
+salvage_cmd() {
+  if [ -n "${ORCHARD_SALVAGE:-}" ]; then printf '%s\n' "$ORCHARD_SALVAGE"; return; fi
+  [ "$(cfg salvage on)" = off ] && return 0
+  local d; d=$(self_dir)
+  if [ -x "$d/worktree-orchard-salvage" ]; then printf '%s\n' "$d/worktree-orchard-salvage"
+  elif command -v worktree-orchard-salvage >/dev/null 2>&1; then command -v worktree-orchard-salvage
+  fi
+}
+
+# The subcommands come first and take their own arguments, so they are parsed
+# here and never reach the option loop below. Each sets a do_* variable that
+# the dispatch section acts on, the same way the picker callbacks do.
+case "${1-}" in
+  new)
+    shift
+    NEW_NAME="${1-}"
+    case "$NEW_NAME" in ""|-*) echo "$PROG: usage: $PROG new <name> [--agent NAME|--NAME|--shell|--none] [--tmux|--no-tmux] [-- args]" >&2; exit 2 ;; esac
+    shift
+    NEW_AGENT=""; NEW_TMUX=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --agent)   NEW_AGENT="${2-}"; [ -n "$NEW_AGENT" ] || { echo "$PROG new: --agent needs a name" >&2; exit 2; }; shift 2 ;;
+        --none)    NEW_AGENT=none; shift ;;
+        --tmux)    NEW_TMUX=1; shift ;;
+        --no-tmux) NEW_TMUX=0; shift ;;
+        --) shift; break ;;
+        # --claude, --shell, and --<name> for any agent the config defines.
+        --?*)
+          if agent_known "${1#--}"; then NEW_AGENT=${1#--}; shift
+          else echo "$PROG new: unknown option $1 (no agent by that name; agent arguments go after --)" >&2; exit 2
+          fi ;;
+        *) echo "$PROG new: unexpected argument $1 (agent arguments go after --)" >&2; exit 2 ;;
+      esac
+    done
+    if [ -n "$NEW_AGENT" ] && [ "$NEW_AGENT" != none ] && ! agent_known "$NEW_AGENT"; then
+      echo "$PROG new: no agent called $NEW_AGENT. Define it as agent.$NEW_AGENT in $CONFIG_FILE" >&2; exit 2
+    fi
+    do_new=1
+    ;;
+  rm)
+    shift
+    RM_FORCE=0
+    [ "${1-}" = -f ] && { RM_FORCE=1; shift; }
+    RM_NAME="${1-}"
+    case "$RM_NAME" in ""|-*) echo "$PROG: usage: $PROG rm [-f] <name>" >&2; exit 2 ;; esac
+    shift
+    [ $# -eq 0 ] || { echo "$PROG rm: unexpected argument $1" >&2; exit 2; }
+    do_rm=1
+    ;;
+  salvage)
+    shift
+    SALVAGE=$(ORCHARD_SALVAGE="${ORCHARD_SALVAGE:-}" salvage_cmd)
+    [ -n "$SALVAGE" ] || { echo "$PROG: worktree-orchard-salvage is not installed beside $PROG or on PATH" >&2; exit 2; }
+    exec "$SALVAGE" "$@"
+    ;;
+esac
+
+while [ "${do_new:-}${do_rm:-}" = "" ] && [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--interactive) INTERACTIVE=1; DIGIT_OPENS=0; shift ;;
+    -ia|--interactive-auto) INTERACTIVE=1; DIGIT_OPENS=1; shift ;;
+    -a|--all)         SCOPE=all; shift ;;
+    --trees)          KINDS=trees; shift ;;
+    --tmux)           KINDS=tmux; shift ;;
+    --no-color)       NO_COLOR=1; export NO_COLOR; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    # ${1-} rather than ${1:?}: fzf passes an empty {1} when the list is empty,
+    # and ${1:?} turned that into a raw bash error inside the preview pane.
+    --preview-row)    exec_preview=1; shift; PREVIEW_KEY="${1-}"; shift ;;
+    --rows)           emit_rows=1; shift ;;
+    --create)         do_create="${2:?}"; shift 2 ;;
+    --row)            ROW_KEY="${2:?}"; shift 2 ;;
+    --teardown)       do_teardown="${2:?}"; shift 2 ;;
+    --rename)         do_rename="${2:?}"; shift 2 ;;
+    --toggle)         do_toggle="${2:?}"; shift 2 ;;
+    --prompt-string)  emit_prompt=1; shift ;;
+    --keys)           show_keys=1; shift ;;
+    --esc-actions)    emit_esc=1; shift ;;
+    # A bare number is a row from the table. It is matched before the catch-all
+    # so that `3` needs no flag, which is the whole point of numbering the
+    # rows: the number you just read is the argument you type.
+    [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) OPEN_NUM="$1"; shift ;;
+    *) echo "$PROG: unknown option $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+ROW_KEY="${ROW_KEY:-}"
+OPEN_NUM="${OPEN_NUM:-}"
+
+# The picker's callbacks are this script run again, once per keystroke, so the
+# config is checked only on the run a person typed.
+case "${exec_preview:-}${emit_rows:-}${do_create:-}${do_teardown:-}${do_rename:-}${do_toggle:-}${emit_prompt:-}${show_keys:-}${emit_esc:-}" in
+  "") check_config ;;
+esac
+
+# What enter, a row number and `new` start when nothing more specific is asked
+# for. Refused rather than ignored when it names no agent, because a typo here
+# would otherwise start something else with no sign the setting was read.
+DEFAULT_AGENT="${ORCHARD_AGENT:-$(cfg default_agent claude)}"
+if ! agent_known "$DEFAULT_AGENT"; then
+  echo "$PROG: the default agent is $DEFAULT_AGENT, which is not defined. Set agent.$DEFAULT_AGENT in $CONFIG_FILE" >&2
+  exit 2
+fi
+# What the o key opens with. Empty means the key does nothing.
+ALT_AGENT=$(cfg alt_agent)
+if [ -n "$ALT_AGENT" ] && ! agent_known "$ALT_AGENT"; then
+  echo "$PROG: alt_agent is $ALT_AGENT, which is not defined. Set agent.$ALT_AGENT in $CONFIG_FILE" >&2
+  exit 2
+fi
+
+# Whether opening a tree wraps the agent in a tmux session. On a machine you
+# reach over SSH a dropped connection must not take the work with it, so the
+# agent gets a session it can outlive the connection in; at a desktop a tmux
+# layer earns nothing and costs a prefix key. auto decides by that test: an
+# SSH session, or Linux with no graphical display, means tmux.
+auto_tmux() {
+  if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then echo 1; return; fi
+  case "$(uname -s)" in
+    Darwin) echo 0 ;;
+    *) if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then echo 0; else echo 1; fi ;;
+  esac
+}
+TMUX_MODE="${ORCHARD_TMUX:-$(cfg tmux auto)}"
+case "$TMUX_MODE" in
+  always) USE_TMUX=1 ;;
+  never)  USE_TMUX=0 ;;
+  auto)   USE_TMUX=$(auto_tmux) ;;
+  *) echo "$PROG: tmux must be auto, always or never, not $TMUX_MODE" >&2; exit 2 ;;
+esac
+
+# The internal record separator is US (0x1f), not a tab. bash counts space, tab
+# and newline as IFS *whitespace*, which means a run of them collapses and
+# leading or trailing ones are stripped. With tab-delimited records, one empty
+# field therefore shifted every field after it: an unstarted session made the
+# repo root read back as empty, and the field after that as missing. US is not
+# IFS whitespace, so empty fields survive. fzf still gets a tab between the key
+# and the label, because that is what --delimiter is set to.
+SEP=$(printf '\037')
+
+# US cannot cross a tmux `-F` boundary, though. tmux escapes every
+# non-printable byte in format output, so 3.4 hands back the four characters
+# \037 in place of the separator and the fields arrive joined. Tab is the one
+# delimiter it passes through untouched, so the session query uses TAB and
+# translates the result back to SEP. The empty-field hazard above does not
+# apply there: a session always has a name, a creation time and a path.
+TAB=$(printf '\t')
+
+# --no-color was accepted, documented, and inert: nothing in this script ever
+# emitted an escape. Rows written for fzf keep their colour because fzf is
+# passed --ansi; the plain table drops it when stdout is not a terminal.
+COLOR=1
+if [ -n "${NO_COLOR:-}" ]; then COLOR=0
+elif [ -z "${emit_rows:-}" ] && [ ! -t 1 ]; then COLOR=0
+fi
+if [ "$COLOR" = 1 ]; then
+  # Literal SGR codes rather than tput. `tput sgr0` on several terminfo entries
+  # also emits shift-in (0x0f), which is invisible on a terminal and shows up as
+  # ^O the moment the output is piped or inspected. The eight basic colours plus
+  # bold and dim are universal; none of them needs a terminfo lookup.
+  C_RESET=$(printf '\033[0m')
+  C_DIM=$(printf '\033[2m')
+  C_BOLD=$(printf '\033[1m')
+  C_RED=$(printf '\033[31m')
+  C_GREEN=$(printf '\033[32m')
+  C_YELLOW=$(printf '\033[33m')
+  C_BLUE=$(printf '\033[34m')
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+# The worktree this shell is standing in, so its row can be marked. Asking git
+# is exact where a prefix test is not: worktrees nest inside the main checkout,
+# and git resolves to the innermost one.
+CURRENT_TREE=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)
+
+W_REPO=0; W_NAME=22; W_SYNC=6; W_BY=6
+WORK="${ORCHARD_WORK_DIR:-}"
+if [ -z "$WORK" ]; then
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/orchard.XXXXXX")
+  trap 'rm -rf "$WORK"' EXIT
+fi
+
+# ---------------------------------------------------------------------------
+# Where are we, and which repos are in scope
+# ---------------------------------------------------------------------------
+
+# Absolute path of the main working tree, correct even when called from inside
+# one of its worktrees. --show-toplevel would answer with the worktree.
+repo_root() {
+  local common
+  common=$(git -C "${1:-$PWD}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  # --git-common-dir gives <root>/.git; the parent is the working tree.
+  printf '%s\n' "$(dirname "$common")"
+}
+
+repos_in_scope() {
+  if [ "$SCOPE" = repo ]; then
+    repo_root || return 1
+    return 0
+  fi
+  # --all: every git repo one level under the code root, plus the root itself
+  # if it is one. Depth is capped at one deliberately; a recursive scan would
+  # descend into the worktrees this command is trying to list.
+  [ -d "$CODE_ROOT/.git" ] && printf '%s\n' "$CODE_ROOT"
+  local d
+  for d in "$CODE_ROOT"/*/; do
+    [ -e "${d}.git" ] && printf '%s\n' "${d%/}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Collect: worktrees, then sessions, then join
+# ---------------------------------------------------------------------------
+
+# Name a worktree the way a human refers to it. The creating tools each bury
+# the useful segment in a different place, so a bare basename is wrong for
+# some of them: Zed appends the repo name as the final segment, which would
+# make every Zed worktree show up called by the repo's name.
+worktree_name() {  # $1 path  $2 repo root
+  local p=$1 root=$2 rel base
+  base=$(basename "$p")
+  case "$p" in
+    "$root") basename "$root"; return ;;
+    "$root/$WORKTREE_DIR"/*) rel=${p#"$root/$WORKTREE_DIR"/}; printf '%s\n' "${rel%%/*}"; return ;;
+    */.claude/worktrees/*) rel=${p#*/.claude/worktrees/}; printf '%s\n' "${rel%%/*}"; return ;;
+    */.zed/worktrees/*)    rel=${p#*/.zed/worktrees/};    printf '%s\n' "${rel%%/*}"; return ;;
+    # Paseo nests its trees one level deeper, under a per-project id:
+    # .paseo/worktrees/<id>/<name>.
+    */.paseo/worktrees/*)  rel=${p#*/.paseo/worktrees/};  rel=${rel#*/}; printf '%s\n' "${rel%%/*}"; return ;;
+  esac
+  # Zed's default `../worktrees` resolves to <parent>/worktrees/<repo>/<name>/<repo>.
+  if [ "$base" = "$(basename "$root")" ]; then
+    local parent; parent=$(basename "$(dirname "$p")")
+    [ -n "$parent" ] && { printf '%s\n' "$parent"; return; }
+  fi
+  printf '%s\n' "$base"
+}
+
+# The register of trees this command created. It lives in the git common dir,
+# so it is invisible to git status and shared by every worktree of the repo.
+register_file() {  # $1 repo root
+  printf '%s/orchard-created\n' "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+}
+
+# Who made a worktree. The register comes first, because `new` puts its trees
+# where `claude --worktree` puts its own, and a path test alone would call
+# every one of them claude. Then come the creator.<label> = <glob> entries
+# from the config, in file order, so a user's own rule beats a built-in one.
+# Then the defaults each tool is known to use.
+worktree_provenance() {  # $1 path  $2 repo root
+  local reg line label glob
+  reg=$(register_file "$2")
+  if [ -f "$reg" ] && grep -qxF "$1" "$reg" 2>/dev/null; then printf 'orchard\n'; return; fi
+  [ "$1" = "$2" ] && { printf 'main\n'; return; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    label=${line%%"$SEP"*}; glob=$(expand_home "${line#*"$SEP"}")
+    # Unquoted on purpose: the value is a glob pattern.
+    # shellcheck disable=SC2053
+    [[ $1 == $glob ]] && { printf '%s\n' "$label"; return; }
+  done < <(cfg_prefixed creator.)
+  case "$1" in
+    */.claude/worktrees/*) printf 'claude\n' ;;
+    */.zed/worktrees/*) printf 'zed\n' ;;
+    */.paseo/worktrees/*) printf 'paseo\n' ;;
+    # emdash's default for an SSH project is <repo>/.emdash/worktrees, and for
+    # a local one ~/emdash/worktrees.
+    */.emdash/worktrees/*|"$HOME"/emdash/worktrees/*) printf 'emdash\n' ;;
+    "$(dirname "$2")"/worktrees/*) printf 'zed\n' ;;
+    *) printf 'git\n' ;;
+  esac
+}
+
+# Uncommitted path count and upstream divergence, for the GIT column. Both are
+# best-effort: a worktree whose directory has been deleted out from under git
+# still shows in `git worktree list`, and must not abort the whole table.
+# The repo's own default branch, as a LOCAL ref. Never a remote-tracking ref:
+# basing a worktree on one makes git write upstream config, which needs
+# .git/config.lock, and some agent sandboxes mask that file.
+default_branch() {  # $1 repo root
+  local b
+  b=$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  b=${b#origin/}
+  [ -n "$b" ] || return 1
+  git -C "$1" rev-parse --verify --quiet "refs/heads/$b" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$b"
+}
+
+git_state() {  # $1 worktree path  $2 repo root -> "<dirty><SEP><ahead/behind>"
+  local p=$1 root=${2:-} dirty="-" ab="-" base
+  if [ -d "$p" ]; then
+    # `wc -l` counts zero lines from a git that died and exits 0, so piping
+    # straight into it reports a corrupt or bare repo as "clean" and walks it
+    # into the teardown gate. Capture the output and the exit code separately.
+    local out
+    if out=$(git -C "$p" status --porcelain 2>/dev/null); then
+      dirty=$(printf '%s\n' "$out" | grep -c . || true)
+      [ "$dirty" = 0 ] && dirty="clean" || dirty="+$dirty"
+    else
+      dirty="UNKNOWN"
+    fi
+    # Trees made here, and by `claude --worktree`, have no upstream, so @{u}
+    # resolves for almost no worktree and this column was a dash on every row
+    # it mattered for. Fall
+    # back to the repo's default branch, which is the comparison that actually
+    # answers "how far along is this tree".
+    local counts ref=""
+    if git -C "$p" rev-parse --verify --quiet '@{u}' >/dev/null 2>&1; then
+      ref='@{u}'
+    elif [ -n "$root" ]; then
+      ref=$(default_branch "$root" 2>/dev/null || true)
+    fi
+    if [ -n "$ref" ] && counts=$(git -C "$p" rev-list --left-right --count "$ref...HEAD" 2>/dev/null); then
+      local behind=${counts%%	*} ahead=${counts##*	}
+      ab=""
+      [ "$ahead"  != 0 ] && ab="↑$ahead"
+      # ${ab} is braced on purpose. macOS still ships bash 3.2, which finds the
+      # end of a $name with the C library's isalnum(), and Darwin's isalnum()
+      # answers true for byte 0xE2 in a UTF-8 locale — the first byte of ↓. So
+      # "$ab↓" was read as a variable named ab<0xE2>, which set -u killed the
+      # script over, reporting the name as bare "ab" because the trailing byte
+      # does not print. It only fired once a tree was actually behind, which is
+      # why the Macs ran for days before a preview pane died on it.
+      [ "$behind" != 0 ] && ab="${ab}↓$behind"
+      [ -z "$ab" ] && ab="="
+    fi
+  else
+    dirty="MISSING"
+  fi
+  printf '%s%s%s\n' "$dirty" "$SEP" "$ab"
+}
+
+human_age() {  # $1 epoch seconds
+  local now delta
+  now=$(date +%s); delta=$(( now - ${1:-$now} ))
+  if   [ "$delta" -lt 3600 ];   then printf '%dm\n' $(( delta / 60 ))
+  elif [ "$delta" -lt 86400 ];  then printf '%dh\n' $(( delta / 3600 ))
+  else printf '%dd\n' $(( delta / 86400 )); fi
+}
+
+# One TSV record per workspace:
+#   key  state  name  branch  git  ahead  by  age  path  session
+collect() {
+  local root name branch line p sha
+  : > "$WORK/trees.tsv"
+  : > "$WORK/seen_sessions"
+  # One tmux query per pass, as name, created and path. Both the path join and
+  # the orphan listing read it, so they cannot disagree about what exists.
+  tmux list-sessions -F "#{session_name}$TAB#{session_created}$TAB#{session_path}" 2>/dev/null \
+    | tr "$TAB" "$SEP" > "$WORK/sessions.tsv" || true
+
+  if [ "$KINDS" != tmux ]; then
+    while IFS= read -r root; do
+      [ -n "$root" ] || continue
+      local reponame; reponame=$(basename "$root")
+      p=""; branch=""; sha=""
+      # --porcelain emits a blank-line-separated stanza per worktree.
+      while IFS= read -r line; do
+        case "$line" in
+          worktree\ *) p=${line#worktree }; branch=""; sha="" ;;
+          HEAD\ *)     sha=${line#HEAD } ;;
+          branch\ *)   branch=${line#branch refs/heads/} ;;
+          detached)    branch="" ;;
+          "")
+            [ -n "$p" ] || continue
+            emit_tree "$p" "$root" "$reponame" "$branch" "$sha"
+            p=""
+            ;;
+        esac
+      done < <(git -C "$root" worktree list --porcelain 2>/dev/null; echo)
+    done < <(repos_in_scope)
+  fi
+
+  if [ "$KINDS" != trees ]; then
+    emit_orphan_sessions
+  fi
+
+  sort -t"$SEP" -k2,2 -k3,3 "$WORK/trees.tsv"
+}
+
+# `git worktree list --porcelain` reports a lock and the parse above drops it.
+# Claude Code locks a worktree for the life of its session, so this is the
+# ordinary state of any workspace worth tearing down, not an edge case.
+# Prints the lock reason if there is one; exit 0 means locked.
+worktree_locked() {  # $1 path  $2 root
+  git -C "$2" worktree list --porcelain 2>/dev/null | awk -v want="$1" '
+    /^worktree / { cur = substr($0, 10); next }
+    /^locked/    { if (cur == want) { print substr($0, 8); found = 1; exit } }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+emit_tree() {  # $1 path  $2 root  $3 reponame  $4 branch  $5 sha
+  local p=$1 root=$2 reponame=$3 branch=$4 sha=$5
+  local name by state sess age gs dirty ab created ismain=0
+  name=$(worktree_name "$p" "$root")
+  by=$(worktree_provenance "$p" "$root")
+  # ismain is captured before `by` is overwritten for display. The previous
+  # version tested the overwritten value against an em dash while the
+  # assignment wrote an ASCII hyphen, so the main tree never matched its own
+  # session: it joined on "<repo>_<repo>", which nothing creates, and so
+  # printed once as a worktree and again as an orphan session.
+  [ "$by" = main ] && { ismain=1; state="⌂"; by="-"; } || state="○"
+  [ -z "$branch" ] && branch="detached ${sha:0:7}"
+
+  # The main tree is looked up under two names. open_row and `new` build
+  # "<repo>_<name>" for every row, and for the main tree <name> is the repo
+  # folder, so the session this script starts there is "<repo>_<repo>". Only the
+  # bare "<repo>" was ever tried, so the tree read as having no session and the
+  # session it had showed up again as an orphan row.
+  local cands=("$reponame"_"$name") cand
+  [ "$ismain" = 1 ] && cands=("$reponame" "$reponame"_"$name")
+  sess=""
+  created=""
+  # A session name alone is not proof: "<repo>_<name>" collides when a repo
+  # folder holds an underscore, so repo foo_bar/baz and repo foo/bar_baz build
+  # the same key and both rows would claim the one session. Confirm the session
+  # is actually sitting in this worktree before joining them.
+  for cand in "${cands[@]}"; do
+    if session_exists "$cand" && session_matches_path "$cand" "$p"; then sess=$cand; break; fi
+  done
+  # Failing that, any session sitting exactly in this directory. A tool that
+  # names its own sessions (emdash) follows no convention, so its tree and its
+  # session were listed as two rows for one workspace.
+  [ -n "$sess" ] || sess=$(session_at_path "$p")
+  if [ -n "$sess" ]; then
+    state="●"
+    created=$(tmux display-message -p -t "=$sess:" '#{session_created}' 2>/dev/null || true)
+    printf '%s\n' "$sess" >> "$WORK/seen_sessions"
+  fi
+
+  gs=$(git_state "$p" "$root"); dirty=${gs%%"$SEP"*}; ab=${gs##*"$SEP"}
+  if [ -n "$created" ]; then age=$(human_age "$created")
+  elif [ -d "$p" ]; then age=$(human_age "$(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null || echo)")
+  else age="-"; fi
+
+  # Field 11 is the repo root. Teardown needs it for a MISSING row, where the
+  # directory is gone and so cannot be asked which repo it belonged to.
+  printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+    "tree:$p" "$SEP" "$state" "$SEP" "$name" "$SEP" "$branch" "$SEP" "$dirty" "$SEP" \
+    "$ab" "$SEP" "$by" "$SEP" "$age" "$SEP" "$p" "$SEP" "$sess" "$SEP" "$root" \
+    >> "$WORK/trees.tsv"
+}
+
+# Sessions with no worktree behind them: a shell in the main tree, a session
+# whose worktree has been removed, or anything you started by hand. Under the
+# default repo scope only this repo's sessions are listed, like its trees: tmux
+# knows nothing about repos, so without the filter every session on the machine
+# showed up as a row, and the list was mostly other projects. --all lifts it.
+emit_orphan_sessions() {
+  local n created path age root="" trees=""
+  if [ "$SCOPE" = repo ]; then
+    # Outside any repo there is nothing to filter by, so nothing is filtered.
+    root=$(repo_root 2>/dev/null || true)
+    [ -z "$root" ] || trees=$(git -C "$root" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  fi
+  while IFS="$SEP" read -r n created path; do
+    [ -n "$n" ] || continue
+    grep -qxF "$n" "$WORK/seen_sessions" 2>/dev/null && continue
+    [ -z "$root" ] || session_in_repo "$n" "${path:-}" "$root" "$trees" || continue
+    age=$(human_age "$created")
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+      "sess:$n" "$SEP" "▸" "$SEP" "$n" "$SEP" "-" "$SEP" "-" "$SEP" \
+      "-" "$SEP" "-" "$SEP" "$age" "$SEP" "${path:-}" "$SEP" "$n" "$SEP" "" \
+      >> "$WORK/trees.tsv"
+  done < "$WORK/sessions.tsv"
+}
+
+# Does this session belong to the repo? Yes when it sits in the repo's main
+# checkout, in any of its worktrees (wherever the tool that made one put it),
+# or in a subdirectory of either, and also when it is named for the repo, which
+# keeps the session of a worktree that has since been removed.
+session_in_repo() {  # $1 name  $2 path  $3 repo root  $4 worktree paths, one per line
+  local n=$1 p=$2 root=$3 trees=$4 t base=${3##*/}
+  case "$n" in "$base"|"$base"_*) return 0 ;; esac
+  [ -n "$p" ] || return 1
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    case "$p" in "$t"|"$t"/*) return 0 ;; esac
+  done < <(printf '%s\n%s\n' "$root" "$trees")
+  return 1
+}
+
+# The newest session that sits exactly in $1 and has not joined another row.
+# Exactly, not "inside": worktrees nest under the main checkout, so a prefix
+# test would hand every nested tree's session to the main tree.
+session_at_path() {  # $1 path
+  awk -v FS="$SEP" -v p="$1" -v seen="$WORK/seen_sessions" '
+    BEGIN { while ((getline l < seen) > 0) used[l] = 1 }
+    $3 == p && !($1 in used) && $2 + 0 > best { best = $2 + 0; name = $1 }
+    END { if (name != "") print name }
+  ' "$WORK/sessions.tsv"
+}
+
+session_exists() { tmux has-session -t "=${1}" 2>/dev/null; }
+
+# True when the session's working directory is the worktree, or inside it. A
+# session started elsewhere and named the same is a different workspace.
+session_matches_path() {  # $1 session  $2 worktree path
+  local sp
+  # "=name:" and not "=name". display-message takes a pane target, and tmux
+  # 3.4 resolves a bare "=name" there to nothing, printing an empty path; the
+  # empty answer below then trusted every same-named session. The trailing
+  # colon makes it the session's current window, which does resolve, while
+  # the = keeps the match exact. The test suite checks this against a real tmux.
+  sp=$(tmux display-message -p -t "=$1:" '#{session_path}' 2>/dev/null || true)
+  [ -n "$sp" ] || return 0          # tmux would not say: do not second-guess it
+  case "$sp" in "$2"|"$2"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+# Truncate to a column width, marking the cut with an ASCII '>' so a clipped
+# name never reads as the whole name. printf's %-Ns pads but does not clip, and
+# one long repo name under --all would otherwise shift every column right of it.
+fit() {  # $1 text  $2 width
+  local t=$1 w=$2
+  if [ "${#t}" -le "$w" ]; then printf '%s\n' "$t"; else printf '%s>\n' "${t:0:$((w-1))}"; fi
+}
+
+# Pad to a column width by CHARACTER count. printf's %-Ns pads by bytes, so a
+# single non-ASCII character in a branch name used to shift every column to its
+# right. fit() already truncates by character, and the two have to agree.
+pad() {  # $1 text  $2 width
+  # Two statements, not one: bash expands every argument of `local` before the
+  # command runs, so ${#t} in the same line reads a t that does not exist yet
+  # and trips set -u.
+  local t=$1 w=$2
+  local n=${#t}
+  printf '%s' "$t"
+  while [ "$n" -lt "$w" ]; do printf ' '; n=$(( n + 1 )); done
+}
+
+# Column widths, derived from the width actually available and from what is in
+# the list. There is no BRANCH column: on almost every row it repeated the name
+# (worktree-<name>, emdash/<name>), and where it did not it said "detached" and
+# a hash. The preview pane carries the branch, so the width goes to the name.
+#
+# Below STACK_BELOW columns, or whenever the budget would clip NAME to a stub,
+# the row takes two lines (STACKED=1) rather than lose a column or a name. Above
+# that, NAME is sized to the longest name in the list, capped at 40.
+GITW=7; W_AGE=4; FLAT_W=0
+STACKED=0; STACK_W=0
+STACK_BELOW="${ORCHARD_STACK_BELOW:-72}"
+compute_widths() {  # $1 available columns  $2 the collected records
+  local avail=$1 recs=${2-} fixed flex maxn=8 maxa=2 maxb=2 want
+  W_REPO=0; W_SYNC=6
+  STACKED=0
+  [ "$SCOPE" = all ] && W_REPO=12
+  if [ -n "$recs" ]; then
+    # Measured on the name as shown, which drops emdash's own prefix. awk counts
+    # bytes under some locales, which can only make a column a little wide.
+    # BY is measured too, because creator labels come from the config.
+    read -r maxn maxa maxb < <(printf '%s\n' "$recs" | awk -v FS="$SEP" '
+      { n = $3; if ($7 == "emdash") sub(/^emdash-/, "", n)
+        if (length(n) > mn) mn = length(n)
+        if (length($8) > ma) ma = length($8)
+        if (length($7) > mb) mb = length($7) }
+      END { print mn + 0, ma + 0, mb + 0 }')
+  fi
+  W_BY=$maxb
+  [ "$W_BY" -lt 2 ] && W_BY=2
+  [ "$W_BY" -gt 10 ] && W_BY=10
+  W_AGE=$maxa
+  [ "$W_AGE" -lt 2 ] && W_AGE=2
+  [ "$maxn" -lt 8 ] && maxn=8
+  # One column of slack, so a printed row never lands exactly on the last column
+  # and wraps on terminals that wrap eagerly.
+  if [ "$avail" -lt "$STACK_BELOW" ]; then
+    STACKED=1; STACK_W=$(( avail - 1 )); return 0
+  fi
+  # Ten columns for the number, marker, state and the gap after it. Two single
+  # spaces: NAME to GIT, and GIT to the next column. Then GIT and AGE themselves,
+  # and SYNC, BY and REPO with the space each one carries.
+  fixed=$(( 10 + 2 + GITW + W_AGE + W_SYNC + 1 + W_BY + 1 ))
+  [ "$W_REPO" != 0 ] && fixed=$(( fixed + W_REPO + 1 ))
+  flex=$(( avail - fixed - 1 ))
+  W_NAME=$maxn
+  [ "$W_NAME" -gt 40 ] && W_NAME=40
+  [ "$W_NAME" -gt "$flex" ] && W_NAME=$flex
+  # A name clipped to a stub is what made the old picker unreadable, so when the
+  # budget leaves NAME under what a real name needs (24, or the longest name if
+  # that is shorter), take two lines per row instead of clipping. The natural
+  # width probe passes a huge width on purpose and never lands here.
+  want=$maxn; [ "$want" -gt 24 ] && want=24
+  if [ "$W_NAME" -lt "$want" ]; then
+    STACKED=1; STACK_W=$(( avail - 1 )); return 0
+  fi
+  FLAT_W=$(( fixed + W_NAME ))
+  # An explicit success: the guard above is the last command, and a false test
+  # there would otherwise make this function return 1 and trip set -e.
+  return 0
+}
+
+# emdash prefixes every worktree folder with "emdash-", and BY already says
+# emdash, so the prefix only spends width. Display only: the stored name stays
+# whole, because rm finds a tree by it.
+display_name() {  # $1 name  $2 by
+  if [ "$2" = emdash ]; then printf '%s\n' "${1#emdash-}"; else printf '%s\n' "$1"; fi
+}
+
+state_color() {  # $1 glyph
+  case "$1" in
+    "●") printf '%s' "$C_GREEN" ;;
+    "▸") printf '%s' "$C_YELLOW" ;;
+    "⌂") printf '%s' "$C_BLUE" ;;
+    *)   printf '%s' "$C_DIM" ;;
+  esac
+}
+
+git_color() {  # $1 dirty field
+  case "$1" in
+    clean)             printf '%s' "$C_DIM" ;;
+    MISSING|UNKNOWN)   printf '%s' "$C_RED" ;;
+    *)                 printf '%s' "$C_YELLOW" ;;
+  esac
+}
+
+# One formatter for both outputs, so the table and the picker cannot drift.
+# Colour is applied around an already-padded field: wrapping first would make
+# the escape bytes count towards the column width.
+# The record still carries a branch, which teardown prints when it leaves one
+# behind, but no row shows it: the preview pane does. It is accepted and ignored
+# here so the callers can pass a whole record.
+row_line() {  # num state name branch dirty ab by age path root
+  local num=$1 state=$2 name=$3 branch=$4 dirty=$5 ab=$6 by=$7 age=$8 path=$9
+  # ${10} braced, because $1 followed by 0 is positional parameter 1 with a
+  # literal zero after it, not parameter ten.
+  local root=${10}
+  local marker=" " repocol=""
+  [ -n "$CURRENT_TREE" ] && [ "$path" = "$CURRENT_TREE" ] && marker="*"
+  name=$(display_name "$name" "$by")
+  if [ "$STACKED" = 1 ]; then
+    stacked_row "$num" "$marker" "$state" "$name" "$dirty" "$ab" "$by" "$age" "$root"
+    return
+  fi
+  if [ "$W_REPO" != 0 ]; then
+    # The repo root travels in field 11 of the record, so naming the repo costs
+    # nothing here. A session row has no worktree behind it and shows a dash.
+    local repo="-"
+    [ -n "$root" ] && repo=${root##*/}
+    repocol="$(pad "$(fit "$repo" "$W_REPO")" "$W_REPO") "
+  fi
+  local synccol="" bycol=""
+  [ "$W_SYNC" != 0 ] && synccol="$(pad "$ab" "$W_SYNC") "
+  [ "$W_BY"   != 0 ] && bycol="$(pad "$(fit "$by" "$W_BY")" "$W_BY") "
+  # The number is right-aligned in two columns so that 9 and 10 line up and the
+  # marker column beside it stays put. Dim, because it is an address rather
+  # than a fact about the workspace, and it must not compete with the state
+  # glyph for the eye.
+  printf '%s%2s%s %s%s%s %s%s%s    %s%s %s%s%s %s%s%s\n' \
+    "$C_DIM" "$num" "$C_RESET" \
+    "$C_BOLD" "$marker" "$C_RESET" \
+    "$(state_color "$state")" "$state" "$C_RESET" \
+    "$repocol" \
+    "$(pad "$(fit "$name" "$W_NAME")" "$W_NAME")" \
+    "$(git_color "$dirty")" "$(pad "$dirty" "$GITW")" "$C_RESET" \
+    "$synccol" "$bycol" "$age"
+}
+
+# The narrow shape: two lines per row. The first carries what you scan by, the
+# number, the state and the name in full, with the age after it. The second,
+# dimmed and indented under the name, carries the detail: git, sync, who made
+# it, and under --all the repo, last because it is the one that can be clipped.
+# A session with no worktree has none of that detail, so its second line says so.
+stacked_row() {  # num marker state name dirty ab by age root
+  local num=$1 marker=$2 state=$3 name=$4 dirty=$5 ab=$6 by=$7 age=$8 root=$9
+  local indent="        "   # eight columns: under the name, past number, marker and state
+  local nw=$(( STACK_W - 8 - 1 - W_AGE ))   # less one space and the age
+  [ "$nw" -lt 8 ] && nw=8
+  printf '%s%2s%s %s%s%s %s%s%s  %s %s\n' \
+    "$C_DIM" "$num" "$C_RESET" \
+    "$C_BOLD" "$marker" "$C_RESET" \
+    "$(state_color "$state")" "$state" "$C_RESET" \
+    "$(pad "$(fit "$name" "$nw")" "$nw")" "$age"
+  if [ "$state" = "▸" ]; then
+    printf '%s%stmux session, no worktree%s\n' "$indent" "$C_DIM" "$C_RESET"
+    return
+  fi
+  local meta="$dirty" tail="" room
+  [ "$ab" != "-" ] && meta="$meta  $ab"
+  [ "$by" != "-" ] && meta="$meta  $by"
+  if [ "$W_REPO" != 0 ] && [ -n "$root" ]; then
+    room=$(( STACK_W - 8 - ${#meta} - 2 ))
+    # Too little room means no repo at all, never a clipped one that reads as a
+    # different repo.
+    [ "$room" -ge 6 ] && tail="  $(fit "${root##*/}" "$room")"
+  fi
+  printf '%s%s%s%s%s%s%s%s\n' "$indent" \
+    "$(git_color "$dirty")" "$dirty" "$C_RESET" "$C_DIM" "${meta#"$dirty"}" "$tail" "$C_RESET"
+}
+
+# The number printed beside a row. It is the row's position in the list, except
+# at ten, which prints as 0 -- because 0 is the key that opens it, the way a
+# browser numbers its tenth tab. Nothing is ever labelled 10, and every row past
+# the tenth prints its position and has no key at all.
+row_number() {
+  if [ "$1" = 10 ]; then printf 0; else printf '%s' "$1"; fi
+}
+
+header_line() {
+  if [ "$STACKED" = 1 ]; then
+    printf '%2s %s %s  %s\n' "#" " " "S" "NAME"
+    local hdr="GIT  SYNC  BY"
+    [ "$W_REPO" != 0 ] && hdr="$hdr  REPO"
+    printf '        %s\n' "$hdr"
+    return
+  fi
+  local repocol="" synccol="" bycol=""
+  [ "$W_REPO" != 0 ] && repocol="$(pad REPO "$W_REPO") "
+  [ "$W_SYNC" != 0 ] && synccol="$(pad SYNC "$W_SYNC") "
+  [ "$W_BY"   != 0 ] && bycol="$(pad BY "$W_BY") "
+  printf '%2s %s %s    %s%s %s %s%s%s\n' \
+    "#" " " "S" "$repocol" "$(pad NAME "$W_NAME")" \
+    "$(pad GIT "$GITW")" "$synccol" "$bycol" AGE
+}
+
+render_table() {
+  local key state name branch dirty ab by age path sess root num=0
+  printf '%s' "$C_DIM"; header_line; printf '%s' "$C_RESET"
+  while IFS="$SEP" read -r key state name branch dirty ab by age path sess root; do
+    [ -n "$key" ] || continue
+    num=$(( num + 1 ))
+    row_line "$(row_number "$num")" "$state" "$name" "$branch" "$dirty" "$ab" "$by" "$age" "$path" "$root"
+  done
+}
+
+# The picker gets the key in field 1 and a preformatted label in field 2, the
+# usual split: fzf shows only --with-nth=2, and every callback reads the
+# key back out of field 1 rather than re-parsing the label.
+render_rows() {
+  local key state name branch dirty ab by age path sess root num=0
+  while IFS="$SEP" read -r key state name branch dirty ab by age path sess root; do
+    [ -n "$key" ] || continue
+    # The number printed on a row and the position fzf's pos() counts to are
+    # the same number only because both are the unfiltered list in this order.
+    # That is why the digit keys are unbound while a filter is being typed: a
+    # filtered list renumbers under fzf and the printed digits would then point
+    # at the wrong rows. The one row where the two differ is the tenth, which
+    # prints as 0 and is reached by pos(10).
+    num=$(( num + 1 ))
+    # A two-line row holds a newline, so rows cannot be newline-ended: fzf is
+    # given --read0 and each row ends in NUL instead. The same function feeds the
+    # reload, so the first draw and every redraw agree on the shape.
+    printf '%s\t%s' "$key" "$(row_line "$(row_number "$num")" "$state" "$name" "$branch" "$dirty" "$ab" "$by" "$age" "$path" "$root")"
+    if [ "$STACKED" = 1 ]; then printf '\0'; else printf '\n'; fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+# Each hook is a shell command from the config file, run with sh -c so it can
+# hold a pipe, with its arguments as $1, $2 and so on. A hook that fails is
+# reported and otherwise ignored: it never stops a tree being made or removed.
+run_hook() {  # $1 hook name  [args...]
+  local name=$1 cmd rc=0
+  shift
+  [ -z "${ORCHARD_NO_HOOKS:-}" ] || return 0
+  cmd=$(cfg "hook.$name")
+  [ -n "$cmd" ] || return 0
+  sh -c "$cmd" "$name" "$@" || rc=$?
+  [ "$rc" = 0 ] || echo "$PROG: hook.$name exited $rc" >&2
+  return 0
+}
+
+# A directory the picker_start hook can fill and the preview hook can read.
+# The picker spawns a fresh preview for every row the cursor lands on, so
+# anything slow belongs in picker_start, which runs once, in the background,
+# as the picker opens. It must write its results atomically (write a temporary
+# name, then rename), because a preview can read the directory at any moment.
+hook_cache() { printf '%s/hook-cache\n' "$WORK"; }
+
+start_picker_hook() {
+  [ -n "$(cfg hook.picker_start)" ] || return 0
+  mkdir -p "$(hook_cache)"
+  ( run_hook picker_start "$(hook_cache)" ) >/dev/null 2>&1 &
+}
+
+# Files named in salvage_keep that exist in the tree. They are what the
+# salvage step would rescue, so they are also the ones worth flagging in the
+# preview: a parked handoff note is gitignored and shows in no git status.
+kept_files_in() {  # $1 tree
+  local f
+  for f in $(cfg salvage_keep); do
+    [ -f "$1/$f" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+preview_row() {  # $1 key
+  local key=$1 path=${1#tree:} sess
+  local w="${FZF_PREVIEW_COLUMNS:-${COLUMNS:-60}}"
+  # An empty key reached here whenever the list was empty, and the expansion
+  # below then failed with a raw "parameter null or not set" in the preview pane.
+  [ -n "$key" ] || { echo "no row selected"; return 0; }
+  case "$key" in
+    sess:*)
+      sess=${key#sess:}
+      echo "tmux session: $sess"; echo
+      tmux list-windows -t "=$sess" -F '  #{window_index}: #{window_name} (#{pane_current_path})' 2>/dev/null
+      # Field 9 is the session's own working directory, which is the only thing
+      # an orphan session can be joined to a transcript on.
+      local spath; spath=$(field_for "$key" 9)
+      if [ -n "$spath" ]; then
+        local block; block=$(run_hook preview "$spath" "$w" "$(hook_cache)" 2>/dev/null)
+        [ -n "$block" ] && { echo; printf '%s\n' "$block"; }
+      fi
+      return ;;
+  esac
+  if [ ! -d "$path" ]; then
+    echo "MISSING: $path"
+    echo
+    echo "git still lists this worktree but the directory is gone."
+    echo "x prunes the metadata."
+    return
+  fi
+  echo "$path"
+  # The branch is not a column any more, so this is where it is shown.
+  echo "branch: $(field_for "$key" 4)"
+  local kept; kept=$(kept_files_in "$path")
+  [ -n "$kept" ] && printf '%s parked here\n' $kept
+  # Above the git output on purpose. "What was this thread doing, and is it
+  # waiting on me" is the question you open the preview to answer; the branch
+  # and the last five commits are the supporting detail under it.
+  local block; block=$(run_hook preview "$path" "$w" "$(hook_cache)" 2>/dev/null)
+  [ -n "$block" ] && { echo; printf '%s\n' "$block"; }
+  echo
+  git -C "$path" status -sb 2>/dev/null | head -20
+  echo
+  git -C "$path" log --oneline -5 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# The key map, drawn over the whole terminal by "?"
+# ---------------------------------------------------------------------------
+# This is a quick reference rather than a second man page. Short, aligned rows
+# keep the map scannable and prevent the pager from wrapping descriptions into
+# the key column on narrower terminals. The longer --help text carries details
+# that are useful before launch but not while operating the picker.
+#
+# Everything here goes to stderr, and that is load-bearing rather than tidy.
+# fzf is run as SELECTED=$(fzf ...), so its stdout is the command substitution's
+# pipe, and an execute() child inherits it. A page written to stdout is
+# therefore not merely invisible: it is captured, and the first line of it
+# becomes $SELECTED the next time you press enter. Every other callback in this
+# file writes to stderr for the same reason.
+keys_text() {
+  local alt="does nothing until alt_agent is set"
+  [ -n "$ALT_AGENT" ] && alt="open with $ALT_AGENT"
+  printf '%s keys\n' "$PROG"
+  cat <<'KEYS'
+
+OPEN
+KEY          ACTION
+1-9, 0       select row (-ia opens it; 0 is tenth)
+enter        open with the default agent; attach if live
+KEYS
+  printf 'o            %s\n' "$alt"
+  cat <<'KEYS'
+s            open with a bare shell
+
+MOVE
+KEY          ACTION
+j / k        down / up
+g / G        first / last
+ctrl-d/u     half-page down / up
+/            search; action keys become text
+esc          clear search; otherwise quit
+q            quit
+
+WORKSPACES
+KEY          ACTION
+n            new worktree + shell session
+t            new worktree only
+x            tear down; confirms first and keeps branch
+r            rename the tmux session
+
+VIEW
+KEY          ACTION
+f            cycle both / sessions / trees
+a            toggle this repo / every repo
+p            show / hide preview
+?            show this page; q returns to the list
+
+COLUMNS
+COLUMN       MEANING
+#            row number (0 is tenth); also works from the shell
+S            ● tree + session    ○ tree only
+             ▸ session only       ⌂ main tree
+*            worktree this shell is in
+REPO         repository; shown only under --all
+NAME         workspace name (branch: see the preview)
+GIT          clean / change count / MISSING / UNKNOWN
+SYNC         ahead / behind its comparison branch
+BY           creator: orchard, claude, zed, paseo, emdash, git
+AGE          session age or last tree change
+
+KEYS
+}
+
+show_keys() {
+  # A pager owns the screen until q and restores the picker when it exits. Keep
+  # it even when the compact map fits: less -F would let the page flash past,
+  # and less -X would leave the map dumped over the picker instead of restoring
+  # the screen underneath.
+  # stdin stays the pipe. Redirecting it to /dev/tty as well looks like it
+  # would help and does the opposite: it replaces the only source of the text,
+  # less finds nothing to page, and it exits so fast the page never appears.
+  # less opens the terminal for its own keystrokes when stdin is a pipe, which
+  # is exactly the case here, so it needs no help finding the keyboard. stdout
+  # does have to be redirected, because under fzf it is a capture pipe.
+  if command -v less >/dev/null 2>&1 && [ -w /dev/tty ]; then
+    keys_text | less -R > /dev/tty
+    return 0
+  fi
+  # No pager. Print it and wait, and accept that a short terminal clips the top.
+  { clear 2>/dev/null || printf '\033[2J\033[H'
+    keys_text
+    printf '  [any key returns]'
+  } >&2
+  # fzf hands the child its own row stream on stdin, so the keypress has to be
+  # read from the terminal directly. Without the guard this blocks forever in a
+  # test that has no tty.
+  if [ -r /dev/tty ]; then
+    read -rsn1 _ < /dev/tty 2>/dev/null || true
+  fi
+  printf '\n' >&2
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+# Open means attach when something is running and create when nothing is.
+# USE_TMUX, set from the tmux setting near the top, decides whether a tmux
+# layer is added.
+open_row() {  # $1 key  $2 agent name
+  local key=$1 agent=$2 path=${1#tree:} sess
+
+  case "$key" in
+    sess:*) attach_session "${key#sess:}"; return ;;
+  esac
+
+  sess=$(field_for "$key" 10)
+  if [ -n "$sess" ]; then attach_session "$sess"; return; fi
+
+  [ -d "$path" ] || { echo "$PROG: $path is gone" >&2; return 1; }
+  sess="$(basename "$(repo_root "$path")")_$(field_for "$key" 3)"
+  launch "$path" "$sess" "$agent" "$USE_TMUX"
+}
+
+# The one place an agent is started in a tree, for the picker, a row number and
+# `new` alike. With tmux it creates the session only if it is not already
+# running, then attaches, or switches when already inside tmux. Without tmux it
+# replaces this process with the agent.
+launch() {  # $1 path  $2 session  $3 agent  $4 tmux: 1|0  [agent args...]
+  local path=$1 sess=$2 agent=$3 usetmux=$4 cmd
+  shift 4
+  # The agent's command may carry its own arguments ("my-agent --fast"), so it
+  # is split into words, ahead of whatever followed -- on the command line.
+  read -r -a cmd <<<"$(agent_command "$agent")"
+  [ "${#cmd[@]}" -gt 0 ] || { echo "$PROG: no agent called $agent" >&2; return 1; }
+  set -- "${cmd[@]}" "$@"
+  if [ "$usetmux" = 1 ]; then
+    if ! session_exists "$sess"; then
+      # A bare shell with no arguments is tmux's own default, which keeps the
+      # login-shell behaviour the user configured rather than a plain exec.
+      if [ "$agent" = shell ] && [ $# -eq 1 ]; then
+        tmux new-session -d -s "$sess" -c "$path" || return 1
+      else
+        tmux new-session -d -s "$sess" -c "$path" "$@" || return 1
+      fi
+    fi
+    attach_session "$sess"
+  else
+    cd "$path" || return 1
+    # exec replaces the process image and bash EXIT traps do not run across it,
+    # so the scratch directory has to go before the handover, not after.
+    [ -n "${ORCHARD_WORK_DIR:-}" ] || rm -rf "$WORK"
+    exec "$@"
+  fi
+}
+
+attach_session() {  # $1 name
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$1"; else tmux attach -t "=$1"; fi
+}
+
+field_for() {  # $1 key  $2 field number
+  awk -v FS="$SEP" -v k="$1" -v n="$2" '$1 == k { print $n; exit }' "$WORK/trees.tsv"
+}
+
+# fzf runs an execute() binding with stdin bound to its own row stream, so a
+# prompt has to read the terminal directly. Falling back to stdin is what makes
+# these paths runnable in a test that has no tty.
+tty_in() { if [ -r /dev/tty ] && [ -t 1 ]; then printf '/dev/tty\n'; else printf '/dev/stdin\n'; fi }
+
+# Keep a callback's output on screen until it is acknowledged. Without this the
+# reload bound to the same key wipes it immediately.
+hold_screen() {
+  [ -n "${ORCHARD_NO_HOLD:-}" ] && return 0
+  [ -r /dev/tty ] || return 0
+  printf '\n[enter] ' >&2
+  read -r _ < /dev/tty 2>/dev/null || true
+}
+
+create_worktree() {  # $1 mode: session|bare
+  local mode=$1 root name sess
+  # The repo comes from the highlighted row, not from $PWD. Under --all the
+  # list spans every repo under the code root, so taking the shell's repo put
+  # the new worktree somewhere the user was not looking, with a prompt that
+  # never said which repo it meant.
+  root=$(field_for "${ROW_KEY:-}" 11 2>/dev/null || true)
+  [ -n "$root" ] || root=$(repo_root) || { echo "$PROG: not inside a git repository" >&2; return 1; }
+  printf 'new worktree in %s\n' "$root" >&2
+  printf 'new worktree name: ' >&2
+  read -r name < "$(tty_in)" || return 0
+  [ -n "$name" ] || return 0
+  make_tree "$root" "$name" || return 1
+
+  if [ "$mode" = session ]; then
+    sess="$(basename "$root")_$name"
+    tmux new-session -d -s "$sess" -c "$NEW_PATH"
+    echo "started session $sess with a shell" >&2
+  fi
+}
+
+# The one creation path. `new` and the n and t keys all come through here, so
+# a tree is the same tree whichever way it was asked for. Sets NEW_PATH.
+make_tree() {  # $1 repo root  $2 name
+  local root=$1 name=$2 path base baseref branch
+  # A dot is rejected, not merely discouraged: tmux reads it as the separator
+  # in "session:window.pane", so a worktree called my.feature either fails to
+  # get a session or gets one named my_feature, which can never rejoin its row.
+  case "$name" in *[!A-Za-z0-9_-]*) echo "$PROG: name may only hold letters, digits, _ and - (a dot breaks tmux session names)" >&2; return 1 ;; esac
+
+  path="$root/$WORKTREE_DIR/$name"
+  branch="$BRANCH_PREFIX$name"
+  [ -e "$path" ] && { echo "$PROG: $path already exists" >&2; return 1; }
+
+  # --no-track, and never a remote-tracking ref as the base: writing upstream
+  # config needs .git/config.lock, which some agent sandboxes mask, and the
+  # failure leaves the index updated with HEAD unmoved.
+  # Base on the repo's own default branch when it exists locally, not on HEAD.
+  # HEAD is whatever the main checkout happens to be sitting on, so a new tree
+  # would silently inherit an unrelated feature branch. The base is printed
+  # either way, so the choice is never silent.
+  base=$(default_branch "$root" 2>/dev/null || true)
+  [ -n "$base" ] || base=HEAD
+  baseref=$(git -C "$root" rev-parse --short "$base" 2>/dev/null || echo '?')
+  git -C "$root" worktree add --no-track -b "$branch" "$path" "$base" >&2 || return 1
+  echo "created $path on branch $branch, based on $base ($baseref)" >&2
+  exclude_worktree_dir "$root"
+  copy_includes "$root" "$path"
+  printf '%s\n' "$path" >> "$(register_file "$root")" 2>/dev/null || true
+  run_hook post_create "$path" "$root" "$name" >&2
+
+  NEW_PATH=$path
+}
+
+# A worktree directory inside the main checkout shows up there as untracked,
+# one `git add -A` away from being committed. When the repo does not already
+# ignore it, the local-only exclude file does, and says so once.
+exclude_worktree_dir() {  # $1 repo root
+  local root=$1 common
+  git -C "$root" check-ignore -q "$WORKTREE_DIR/probe" 2>/dev/null && return 0
+  common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir) || return 0
+  mkdir -p "$common/info" && printf '/%s/\n' "$WORKTREE_DIR" >> "$common/info/exclude" \
+    && echo "added /$WORKTREE_DIR/ to $common/info/exclude so the main checkout ignores it" >&2
+  return 0
+}
+
+# .worktreeinclude names the gitignored files a fresh checkout needs, in
+# .gitignore syntax: .env, .claude/settings.local.json and the like. A file is
+# copied only when it matches a pattern there AND git ignores it, so a tracked
+# file, or an untracked one git does not ignore, is never duplicated. That is
+# the rule `claude --worktree` applies, kept so a tree made here matches one
+# made there. A directory entry, which is how git reports a nested
+# repository or another worktree, is skipped rather than copied whole.
+copy_includes() {  # $1 repo root  $2 new tree
+  local root=$1 tree=$2 inc="$1/.worktreeinclude" f n=0
+  if [ ! -f "$inc" ]; then
+    echo "no .worktreeinclude in $(basename "$root"), so no gitignored files were copied" >&2
+    return 0
+  fi
+  while IFS= read -r -d '' f; do
+    case "$f" in */) continue ;; esac
+    [ -f "$root/$f" ] || continue
+    mkdir -p "$tree/$(dirname "$f")" && cp -p "$root/$f" "$tree/$f" && n=$(( n + 1 ))
+  done < <(git -C "$root" ls-files -z --others --ignored --exclude-from="$inc" 2>/dev/null \
+             | git -C "$root" check-ignore -z --stdin 2>/dev/null)
+  echo "copied $n gitignored file(s) named in .worktreeinclude" >&2
+}
+
+# `rm <name>`: the one worktree of this repo with that name, torn down the
+# way the x key does it. The main working tree is never a candidate. -f lifts a
+# lock first, because Claude Code locks a tree for the life of its session.
+rm_by_name() {  # $1 name  $2 force: 1|0
+  local name=$1 force=$2 keys n key
+  keys=$(awk -v FS="$SEP" -v want="$name" '$1 ~ /^tree:/ && $3 == want && $7 != "-" { print $1 }' "$WORK/trees.tsv")
+  n=$(printf '%s\n' "$keys" | grep -c . || true)
+  if [ "$n" = 0 ]; then
+    echo "$PROG: no worktree called $name in $(basename "$(repo_root)"). \`$PROG --trees\` lists them." >&2
+    return 1
+  fi
+  if [ "$n" -gt 1 ]; then
+    echo "$PROG: $n worktrees are called $name; remove the right one from the picker ($PROG -i, then x):" >&2
+    printf '%s\n' "$keys" | sed 's/^tree:/    /' >&2
+    return 1
+  fi
+  key=$keys
+  if [ "$force" = 1 ] && worktree_locked "${key#tree:}" "$(field_for "$key" 11)" >/dev/null; then
+    git -C "$(field_for "$key" 11)" worktree unlock "${key#tree:}" && echo "unlocked $name" >&2
+  fi
+  teardown_row "$key"
+}
+
+teardown_row() {  # $1 key
+  local key=$1 path=${1#tree:} name sess dirty
+  case "$key" in
+    sess:*)
+      sess=${key#sess:}
+      confirm "kill tmux session $sess?" || return 0
+      tmux kill-session -t "=$sess"
+      echo "killed $sess" >&2
+      return ;;
+  esac
+
+  name=$(field_for "$key" 3)
+  sess=$(field_for "$key" 10)
+  dirty=$(field_for "$key" 5)
+
+  # A key that is not in the table yields empty fields, which then fall through
+  # to the "uncommitted changes ()" branch and read as a git problem rather than
+  # a stale row. It happens whenever the list moved under a pending keystroke.
+  if [ -z "$dirty" ]; then
+    echo "$PROG: $key is no longer in the list. Press f three times to reload." >&2
+    return 1
+  fi
+
+  # Field 11 carries the repo root because a MISSING worktree cannot be asked
+  # for its own. Falling back to $PWD here was pruning whichever repo the shell
+  # happened to sit in rather than the one the highlighted row belongs to.
+  local root; root=$(field_for "$key" 11)
+  [ -n "$root" ] || root=$(repo_root "$path" 2>/dev/null || repo_root)
+
+  if [ "$dirty" = MISSING ]; then
+    confirm "prune metadata for the missing worktree $name in $root?" || return 0
+    git -C "$root" worktree prune
+    echo "pruned $name from $root" >&2
+    run_hook post_remove "$path" "$root" "$name" >&2
+    return
+  fi
+
+  # UNKNOWN means `git status` itself failed, so nothing is known about what is
+  # in the tree. That is a reason to stop, not a reason to proceed quietly.
+  if [ "$dirty" = UNKNOWN ]; then
+    echo "$PROG: cannot read git status in $path, so it will not be removed." >&2
+    return 1
+  fi
+
+  # A branch can hold commits that exist nowhere else, so removal never touches
+  # one. The delete command is printed instead.
+  if [ "$dirty" != clean ]; then
+    echo "$PROG: $name has uncommitted changes ($dirty). Commit or discard them first." >&2
+    return 1
+  fi
+
+  # git refuses to remove a locked worktree, and Claude Code locks one for the
+  # life of its session. Catching it here means the refusal arrives before
+  # anything has been touched, with the unlock command attached.
+  local lockreason
+  if lockreason=$(worktree_locked "$path" "$root"); then
+    echo "$PROG: $name is locked${lockreason:+ ($lockreason)} and git will not remove it." >&2
+    echo "    Claude Code holds a lock for the life of its session. Close that" >&2
+    echo "    session, or unlock and remove it in one step: $PROG rm -f $name" >&2
+    return 1
+  fi
+
+  # The salvage step decides what removal would destroy: commits no remote has,
+  # and the gitignored files a session would miss (salvage_keep, and changed
+  # .worktreeinclude files). `git status --porcelain` says nothing about either.
+  # Unpushed commits refuse here; the files are copied to the main checkout's
+  # tmp/salvage/ after the confirm. With salvage off, a warning stands in.
+  local salvage; salvage=$(salvage_cmd)
+  if [ -n "$salvage" ]; then
+    local rc=0
+    "$salvage" --check "$path" >&2 || rc=$?
+    if [ "$rc" = 1 ]; then
+      echo "$PROG: $name holds work no remote has, so it will not be removed. Push it first." >&2
+      return 1
+    elif [ "$rc" != 0 ]; then
+      echo "$PROG: salvage failed (exit $rc), so $name will not be removed." >&2
+      return 1
+    fi
+  else
+    local ignored count sample
+    ignored=$(git -C "$path" status --porcelain --ignored 2>/dev/null | sed -n 's/^!! //p' | grep -v '^\.claude/' || true)
+    count=$(printf '%s\n' "$ignored" | grep -c . || true)
+    if [ "$count" != 0 ]; then
+      sample=$(printf '%s\n' "$ignored" | head -4 | tr '\n' ' ')
+      echo "$PROG: $name holds $count gitignored path(s) that removal destroys permanently:" >&2
+      echo "    $sample" >&2
+    fi
+  fi
+
+  confirm "remove worktree $name at $path?" || return 0
+
+  # Resolved now, while the directory still exists to resolve.
+  local real; real=$(cd "$path" 2>/dev/null && pwd -P) || real=$path
+
+  if [ -n "$salvage" ] && ! "$salvage" --block "$path"; then
+    echo "$PROG: salvage did not finish, so $name was left in place." >&2
+    return 1
+  fi
+
+  # Remove first, then kill the session and run the post_remove hook. The
+  # removal is the step that can fail; the other two cannot be undone. Doing
+  # them the other way round loses both and keeps the tree whenever git refuses.
+  if ! git -C "$root" worktree remove "$path"; then
+    echo "$PROG: git would not remove $path, so its session was left alone." >&2
+    return 1
+  fi
+  git -C "$root" worktree prune
+  echo "removed $path" >&2
+  run_hook post_remove "$real" "$root" "$name" >&2
+  [ -n "$sess" ] && { tmux kill-session -t "=$sess" 2>/dev/null || true; echo "killed session $sess" >&2; }
+  local br; br=$(field_for "$key" 4)
+  case "$br" in
+    detached\ *) ;;
+    *) echo "branch $br is still there: git -C $root branch -d $br" >&2 ;;
+  esac
+}
+
+rename_row() {  # $1 key
+  local sess new
+  sess=$(field_for "$1" 10)
+  [ -n "$sess" ] || { echo "$PROG: that row has no session to rename" >&2; return 1; }
+  printf 'new name for %s: ' "$sess" >&2
+  read -r new < "$(tty_in)" || return 0
+  [ -n "$new" ] || return 0
+  tmux rename-session -t "=$sess" "$new"
+}
+
+confirm() {
+  printf '%s [y/N] ' "$1" >&2
+  local a; read -r a < "$(tty_in)" || return 1
+  case "$a" in y|Y|yes|YES) return 0 ;; *) echo "cancelled" >&2; return 1 ;; esac
+}
+
+# Filter toggles have to survive a reload, because the reload is a fresh
+# process. A file in the work directory is the whole mechanism.
+apply_toggle() {  # $1 which
+  local f="$WORK/state"
+  [ -f "$f" ] || printf '%s\n%s\n' "$KINDS" "$SCOPE" > "$f"
+  local k s; { read -r k; read -r s; } < "$f"
+  case "$1" in
+    kinds) case "$k" in both) k=tmux ;; tmux) k=trees ;; *) k=both ;; esac ;;
+    scope) case "$s" in repo) s=all ;; *) s=repo ;; esac ;;
+  esac
+  printf '%s\n%s\n' "$k" "$s" > "$f"
+}
+
+load_toggle() {
+  local f="$WORK/state"
+  [ -f "$f" ] || return 0
+  { read -r KINDS; read -r SCOPE; } < "$f"
+}
+
+# esc has to mean two different things and fzf's keymap can only hold one
+# binding per key. unbind() does not help: it deletes the binding outright
+# rather than falling back to fzf's own default, so an unbound esc is a dead
+# key, not an abort. The way out is fzf's transform action, which runs a
+# command and executes whatever actions it prints. So esc always calls this,
+# and this decides.
+#
+# The mode is tracked in a file rather than inferred, because the only other
+# signal available is the prompt string and that would make the prompt text
+# load-bearing. "/" writes filter, this writes normal back.
+#
+# transform arrived in fzf 0.45. Ubuntu's apt build is pinned at 0.44.1
+# forever, which is why the package install script tops Linux up from the
+# upstream release binary.
+esc_actions() {
+  local f="$WORK/mode" mode=normal
+  [ -f "$f" ] && mode=$(cat "$f")
+  if [ "$mode" = filter ]; then
+    printf normal > "$f"
+    # change-prompt rather than transform-prompt: this callback already knows
+    # the toggle state, so it can write the prompt out and save fzf a second
+    # round trip into this script.
+    printf 'clear-query+disable-search+rebind(%s)+change-prompt(%s %s/%s> )' \
+      "$ACTION_KEYS" "$PROG" "$KINDS" "$SCOPE"
+  else
+    printf abort
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Self-dispatch: the picker calls back into this script for these
+# ---------------------------------------------------------------------------
+
+# ORCHARD_PICKER_DRY_RUN is exported into every child of the picker, so it reads as a
+# global safety switch. It used to be checked only below the self-dispatch, and
+# so gated the fzf draw and nothing else: a dry-run --teardown performed a real
+# teardown. The read-only callbacks still run, because a dry
+# run that cannot render its own rows tests nothing.
+if [ -n "${ORCHARD_PICKER_DRY_RUN:-}" ]; then
+  case "${do_create:-}${do_teardown:-}${do_rename:-}${do_new:-}${do_rm:-}" in
+    ?*) echo "$PROG: ORCHARD_PICKER_DRY_RUN is set, so this action was not performed." >&2; exit 0 ;;
+  esac
+fi
+
+# Read-only and self-contained, so it runs ahead of everything else and needs
+# neither the toggle state nor a collect pass.
+if [ -n "${show_keys:-}" ];    then show_keys; exit 0; fi
+if [ -n "${emit_esc:-}" ];     then load_toggle; esc_actions; exit 0; fi
+if [ -n "${exec_preview:-}" ]; then load_toggle; collect >/dev/null; preview_row "$PREVIEW_KEY"; exit 0; fi
+if [ -n "${emit_rows:-}" ];    then
+  load_toggle
+  # Collected first, because the column widths are sized to what is in the list.
+  SORTED=$(collect); compute_widths "${ORCHARD_LIST_COLS:-80}" "$SORTED"
+  [ -n "$SORTED" ] && printf '%s\n' "$SORTED" | render_rows
+  exit 0
+fi
+# hold_screen after each of these: fzf redraws the moment the callback returns,
+# so every line they print flashed for one frame and vanished. That included the
+# only place the leftover branch name is ever shown.
+if [ -n "${do_create:-}" ];    then load_toggle; collect >/dev/null; create_worktree "$do_create" || true; hold_screen; exit 0; fi
+if [ -n "${do_teardown:-}" ];  then load_toggle; collect >/dev/null; teardown_row "$do_teardown" || true; hold_screen; exit 0; fi
+if [ -n "${do_rename:-}" ];    then load_toggle; collect >/dev/null; rename_row "$do_rename" || true; hold_screen; exit 0; fi
+if [ -n "${do_toggle:-}" ];    then apply_toggle "$do_toggle"; exit 0; fi
+# The filter and the scope had no representation on screen at all, so ctrl-f
+# looked inert whenever two of its three states rendered the same list, and
+# toggling scope changed the row count with nothing to say why. transform-prompt
+# re-runs this after every toggle, so the prompt always names the live state.
+if [ -n "${emit_prompt:-}" ];  then load_toggle; printf '%s %s/%s> ' "$PROG" "$KINDS" "$SCOPE"; exit 0; fi
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+if [ -n "${do_new:-}" ]; then
+  NEW_ROOT=$(repo_root) || { echo "$PROG: not inside a git repository" >&2; exit 1; }
+  make_tree "$NEW_ROOT" "$NEW_NAME" || exit 1
+  NEW_AGENT=${NEW_AGENT:-$DEFAULT_AGENT}
+  [ "$NEW_AGENT" = none ] && exit 0
+  # "$@" is whatever followed --, untouched by the option loop, which the
+  # subcommand parse skips.
+  launch "$NEW_PATH" "$(basename "$NEW_ROOT")_$NEW_NAME" "$NEW_AGENT" "${NEW_TMUX:-$USE_TMUX}" "$@"
+  exit $?
+fi
+if [ -n "${do_rm:-}" ]; then
+  repo_root >/dev/null || { echo "$PROG: not inside a git repository" >&2; exit 1; }
+  SCOPE=repo; KINDS=trees
+  collect >/dev/null
+  rm_by_name "$RM_NAME" "$RM_FORCE"
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+SORTED=$(collect)
+
+# A pipe has no width to fit, and tput answers 80 for it, which would turn
+# `worktree-orchard | grep` into two-line rows. Only a terminal gets the narrow shape.
+if [ -t 1 ]; then TABLE_COLS=$(tput cols 2>/dev/null || echo 80); else TABLE_COLS=200; fi
+compute_widths "$TABLE_COLS" "$SORTED"
+
+# A row number. The number indexes the list exactly as the table just printed it, so
+# it is read off the same sorted records rather than re-derived: any filter or
+# scope flag given alongside the number has to select the same rows the number
+# was read from. `--all 3` and `3` therefore mean different rows.
+if [ -n "$OPEN_NUM" ]; then
+  # The printed number and the row's position agree everywhere except the
+  # tenth row, which prints as 0 so that the key you press is the number you
+  # read. The shell argument is translated back the same way. 10# forces base
+  # ten: bash reads a leading zero as octal, so `08` would otherwise die on
+  # the 8 rather than open the eighth row.
+  POS=$(( 10#$OPEN_NUM ))
+  if [ "$POS" -eq 0 ]; then
+    POS=10
+  elif [ "$POS" -eq 10 ]; then
+    echo "$PROG: the tenth row is printed as 0, so it is \`$PROG 0\`. Nothing is numbered 10." >&2
+    exit 1
+  fi
+  [ -n "$SORTED" ] || { echo "$PROG: nothing to show" >&2; exit 1; }
+  ROW=$(printf '%s\n' "$SORTED" | sed -n "${POS}p")
+  if [ -z "$ROW" ]; then
+    TOTAL=$(printf '%s\n' "$SORTED" | grep -c . || true)
+    echo "$PROG: there is no row $OPEN_NUM. The list has $TOTAL." >&2
+    exit 1
+  fi
+  open_row "${ROW%%"$SEP"*}" "$DEFAULT_AGENT"
+  exit $?
+fi
+
+if [ "$INTERACTIVE" = 0 ]; then
+  [ -n "$SORTED" ] || { echo "$PROG: nothing to show" >&2; exit 0; }
+  printf '%s\n' "$SORTED" | render_table
+  exit 0
+fi
+
+# The interactive path had no empty check, so printf on an empty string emitted
+# one line, which rendered as a blank selectable row whose preview was a raw
+# bash "parameter null or not set".
+if [ -z "$SORTED" ]; then
+  echo "$PROG: nothing to show. Try a wider filter: $PROG -i --all" >&2
+  exit 0
+fi
+
+# A dry run neither launches fzf nor draws, so neither prerequisite applies to
+# it. Checking them first is what makes picker tests fail on a runner that has
+# no fzf and no tty while passing on a workstation that has both.
+if [ -z "${ORCHARD_PICKER_DRY_RUN:-}" ]; then
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "$PROG: -i needs fzf, which is not on PATH. Printing the table instead." >&2
+    collect | render_table; exit 0
+  fi
+  # The esc binding needs fzf's transform action, which arrived in 0.45.
+  # Ubuntu's apt build is 0.44, so this is the version people actually trip on.
+  FZF_VER=$(fzf --version 2>/dev/null | awk '{print $1}')
+  case "$FZF_VER" in
+    0.[0-9]|0.[0-9].*|0.[1-3][0-9]|0.[1-3][0-9].*|0.4[0-4]|0.4[0-4].*)
+      echo "$PROG: -i needs fzf 0.45 or newer, and this one is $FZF_VER. Printing the table instead." >&2
+      collect | render_table; exit 0 ;;
+  esac
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "$PROG: -i needs a terminal. Printing the table instead." >&2
+    collect | render_table; exit 0
+  fi
+fi
+
+COLS=$(tput cols 2>/dev/null || echo 80)
+# The list pane is what the rows have to fit, so it is derived, not guessed.
+# Seven columns go to fzf: the border (2), its padding (2), the pointer and its
+# space (2) and one the clip eats. It was four, measured wrong, and a row that
+# many columns too wide is clipped with its last field, which is how AGE went
+# missing. The preview wraps, because a commit subject clipped at the pane edge
+# reads as a different commit.
+#
+# Where the preview goes is decided by whether the list fits beside it. Docked
+# right at a fixed share, the list got 45% of the screen and was clipped at any
+# width short of enormous. Now it docks right only when the list at its natural
+# width leaves the preview at least PREVIEW_MIN_COLS columns; otherwise the
+# preview goes underneath and the list keeps the whole width, in two lines per
+# row if even that is too narrow for one.
+compute_widths 9999 "$SORTED"
+# A short list is padded out to STACK_BELOW so that docking the preview never
+# turns a list that fits on one line into the two-line shape.
+LIST_COLS=$FLAT_W
+[ "$LIST_COLS" -lt "$STACK_BELOW" ] && LIST_COLS=$STACK_BELOW
+# The preview size excludes the preview's own border and padding, four more
+# columns, which is why this is 11 and not the 7 the list itself costs.
+PREVIEW_COLS=$(( COLS - LIST_COLS - 11 ))
+if [ "$PREVIEW_COLS" -ge "$PREVIEW_MIN_COLS" ]; then
+  PREVIEW_WINDOW="right,$PREVIEW_COLS,wrap"
+else
+  PREVIEW_WINDOW="down,40%,wrap"
+  LIST_COLS=$(( COLS - 7 ))
+fi
+[ "$LIST_COLS" -lt 30 ] && LIST_COLS=30
+compute_widths "$LIST_COLS" "$SORTED"
+
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+export ORCHARD_WORK_DIR="$WORK" ORCHARD_CODE_ROOT="$CODE_ROOT" ORCHARD_LIST_COLS="$LIST_COLS"
+printf '%s\n%s\n' "$KINDS" "$SCOPE" > "$WORK/state"
+RELOAD="'$SELF' --rows"
+
+printf '%s\n' "$SORTED" | render_rows > "$WORK/rows.tsv"
+
+# The picker is modal, the way vi is, and for the same reason: with search
+# switched off, every printable key is free to be an action, so nothing needs a
+# chord. "/" trades the action keys for a search field and esc trades them back.
+# ACTION_KEYS, defined at the top of this file, is the exact set that swaps, so
+# the two binds below cannot drift apart -- a key unbound on "/" and not
+# rebound on esc is dead for the rest of the session, with nothing on screen to
+# say why.
+#
+# The mode file is what tells esc which of its two jobs to do. It starts in
+# normal, so a picker launched into a fresh work dir quits on esc.
+printf normal > "$WORK/mode"
+
+# The header is the column names now, not a key list: the compact key map lives
+# under "?" where it can use the whole terminal without crowding the rows.
+# --layout=reverse-list puts the prompt at the bottom and the header rides with
+# the prompt, so this lands directly under the list it labels.
+HEADER_COLS="$C_DIM$(header_line)$C_RESET"
+# Two-line rows are NUL-ended, so fzf has to be told.
+READ0=""; [ "$STACKED" = 1 ] && READ0=--read0
+
+# The picker_start hook is started before fzf, not from inside it, so whatever
+# it costs overlaps the time spent reading the first screen rather than
+# delaying it. Everything it feeds degrades to absent, so nothing waits on it.
+start_picker_hook
+
+# o opens with alt_agent. With none set it is bound to ignore rather than left
+# unbound, so "/" and esc can unbind and rebind it like every other action key.
+O_BIND="o:ignore"
+[ -n "$ALT_AGENT" ] && O_BIND="o:execute-silent(printf '%s' '$ALT_AGENT' > '$WORK/openmode')+accept"
+
+set -- --ansi ${READ0:+"$READ0"} --delimiter="$(printf '\t')" --with-nth=2 \
+       --layout=reverse-list --border --info=inline --height=100% --no-multi \
+       --disabled --prompt "$(printf '%s %s/%s> ' "$PROG" "$KINDS" "$SCOPE")" \
+       --preview-window="$PREVIEW_WINDOW" \
+       --preview "'$SELF' --preview-row {1}" \
+       --bind 'j:down' --bind 'k:up' \
+       --bind 'g:first' --bind 'G:last' \
+       --bind 'ctrl-d:half-page-down' --bind 'ctrl-u:half-page-up' \
+       --bind 'p:toggle-preview' \
+       --bind 'q:abort' \
+       --bind "/:execute-silent(printf filter > '$WORK/mode')+unbind($ACTION_KEYS)+enable-search+change-prompt(filter> )" \
+       --bind "esc:transform('$SELF' --esc-actions)" \
+       --bind "s:execute-silent(printf shell > '$WORK/openmode')+accept" \
+       --bind "$O_BIND" \
+       --bind "n:execute('$SELF' --create session --row {1})+reload($RELOAD)" \
+       --bind "t:execute('$SELF' --create bare --row {1})+reload($RELOAD)" \
+       --bind "x:execute('$SELF' --teardown {1})+reload($RELOAD)" \
+       --bind "r:execute('$SELF' --rename {1})+reload($RELOAD)" \
+       --bind "f:execute-silent('$SELF' --toggle kinds)+reload($RELOAD)+transform-prompt('$SELF' --prompt-string)" \
+       --bind "a:execute-silent('$SELF' --toggle scope)+reload($RELOAD)+transform-prompt('$SELF' --prompt-string)" \
+       --bind "?:execute('$SELF' --keys)" \
+       --header "$HEADER_COLS"
+
+# pos(N) counts within the list fzf currently holds, and the number printed on
+# a row counts within the list this script wrote, so the two agree only while no filter
+# is applied. That is guaranteed rather than hoped for: every digit is in
+# ACTION_KEYS, so "/" unbinds all ten and esc rebinds them, and there is no
+# state in which a digit acts on a filtered list.
+#
+# Under -ia the digit also accepts, and it is fzf's own accept rather than a
+# separate open path, so a numbered open and enter cannot drift apart. Under
+# -i it only moves, which is the point of the flag: the digit is a jump, and
+# you still choose between enter and s once you are there.
+digit_bind() {  # printed-digit  list-position
+  local action="pos($2)"
+  [ "$DIGIT_OPENS" = 1 ] && action="$action+accept"
+  printf '%s:%s' "$1" "$action"
+}
+digit=1
+while [ "$digit" -le 9 ]; do
+  set -- "$@" --bind "$(digit_bind "$digit" "$digit")"
+  digit=$(( digit + 1 ))
+done
+# 0 opens the tenth row, and the tenth row is printed as 0, so the key and the
+# label match rather than needing to be learned.
+set -- "$@" --bind "$(digit_bind 0 10)"
+
+if [ -n "${ORCHARD_PICKER_DRY_RUN:-}" ]; then
+  printf 'preview-window\t%s\n' "$PREVIEW_WINDOW"
+  printf 'tmux\t%s\n' "$USE_TMUX"
+  printf 'fzf-args\t%s\n' "$*"
+  cat "$WORK/rows.tsv"
+  exit 0
+fi
+
+# "s" and "o" write their choice to a file and then accept, rather than riding out on
+# --expect. --expect intercepts its key ahead of everything else, so an
+# --expect=s would abort the picker every time an "s" was typed into the filter.
+SELECTED=$(fzf "$@" < "$WORK/rows.tsv") || exit 0
+[ -n "$SELECTED" ] || exit 0
+KEY=${SELECTED%%	*}
+
+RUNNER=$DEFAULT_AGENT
+[ -f "$WORK/openmode" ] && RUNNER=$(cat "$WORK/openmode")
+
+load_toggle
+collect > /dev/null
+open_row "$KEY" "$RUNNER"
