@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# The token a run gets can read the repo and nothing else, so a workflow
+# run from someone's pull request cannot push, tag or comment.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest

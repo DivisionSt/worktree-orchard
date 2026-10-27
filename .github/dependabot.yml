@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Opens a pull request when an action the CI workflow uses has a new version.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

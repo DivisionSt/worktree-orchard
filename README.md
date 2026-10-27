@@ -276,6 +276,16 @@ make lint    # shellcheck at warning level
 
 The tests replace tmux, the agents and the shell with stand-ins that record their arguments, so almost the whole suite runs anywhere, including CI runners and sandboxes. One section needs real tmux behaviour: it starts a server on a private socket, never your default one, and skips itself where none can start. Behaviour changes and test changes go together; the comments in the script say why each odd-looking choice was made, and most of them record a bug that the obvious version had.
 
+## How are versions numbered?
+
+With [semantic versioning](https://semver.org), released as git tags (`v0.1.0`) with notes on the [releases page](https://github.com/DivisionSt/worktree-orchard/releases). Install a tag rather than `main` if you want to choose when you take changes.
+
+The interface the version number protects is the commands, subcommands and flags; the config keys and what they mean; the `ORCHARD_*` environment variables; each hook's name, timing and arguments; the `<repo>_<name>` session naming; and the salvage script's options, exit codes and where it saves. A change that breaks any of those is a major version; a new feature is a minor version; a fix is a patch. While the major version is 0, a minor version may still break something, and its release notes say what.
+
+## How do I report a problem or contribute?
+
+Bugs and ideas go in [issues](https://github.com/DivisionSt/worktree-orchard/issues). Security problems go through the private route in [SECURITY.md](SECURITY.md). [CONTRIBUTING.md](CONTRIBUTING.md) says what to expect from a pull request and what it has to pass.
+
 ## License
 
 [MIT](LICENSE).
