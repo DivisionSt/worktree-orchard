@@ -28,7 +28,9 @@ SRC=$(cd "$(dirname "$SRC")" && pwd)/$(basename "$SRC")
 SALV_SRC="$(dirname "$SRC")/worktree-orchard-salvage"
 command -v git >/dev/null 2>&1 || { echo "test-worktree-orchard: git is required" >&2; exit 2; }
 
-WORK=$(mktemp -d) || exit 2
+# Resolved, because macOS's temp dir sits under the /var -> /private/var
+# symlink and git reports the resolved path.
+WORK=$(cd "$(mktemp -d)" && pwd -P) || exit 2
 trap 'rm -rf "$WORK"' EXIT
 # The script under test is copied in under its real name, and with no salvage
 # script beside it, so each test chooses its salvage explicitly.

@@ -21,7 +21,9 @@ if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
 fi
 SRC=$(cd "$(dirname "$SRC")" && pwd)/$(basename "$SRC")
 
-WORK=$(mktemp -d) || exit 2
+# Resolved, because macOS's temp dir sits under the /var -> /private/var
+# symlink and git reports the resolved path.
+WORK=$(cd "$(mktemp -d)" && pwd -P) || exit 2
 trap 'rm -rf "$WORK"' EXIT
 export GIT_CONFIG_GLOBAL="$WORK/gitconfig" GIT_CONFIG_NOSYSTEM=1
 git config --file "$GIT_CONFIG_GLOBAL" user.name test

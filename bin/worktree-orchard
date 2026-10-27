@@ -1461,6 +1461,12 @@ teardown_row() {  # $1 key
   # tmp/salvage/ after the confirm. With salvage off, a warning stands in.
   local salvage; salvage=$(salvage_cmd)
   if [ -n "$salvage" ]; then
+    # Checked up front because bash 3.2 exits 1, not 127, for a missing
+    # command, and 1 is what --check uses to mean unpushed work.
+    if ! command -v "$salvage" >/dev/null 2>&1; then
+      echo "$PROG: salvage failed (cannot run $salvage), so $name will not be removed." >&2
+      return 1
+    fi
     local rc=0
     "$salvage" --check "$path" >&2 || rc=$?
     if [ "$rc" = 1 ]; then
