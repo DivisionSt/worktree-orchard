@@ -198,6 +198,48 @@ check "a bad tmux value is refused" "$?" 2
 run "$R/.claude/worktrees/plain" new from-inside --none
 [ -d "$R/.claude/worktrees/from-inside" ] && ok "new from inside a worktree targets the main repo" || bad "new from inside a worktree targets the main repo" "$(cat "$WORK/err")"
 
+# === open: an existing tree, with agent arguments =============================
+# The two cases it exists for: resuming a conversation in its own tree, and a
+# tree made with --none whose agent starts later, after files were put in it.
+run "$R" open plain -- --resume abc123
+check "open exits 0" "$?" 0
+has "open starts the agent with its args in a <repo>_<name> session" "$(logged)" "tmux new-session -d -s proj_plain -c $R/.claude/worktrees/plain claude --resume abc123"
+has "then attaches to it" "$(logged)" "tmux attach -t =proj_plain"
+run "$R" new op1 --none
+TMUX=fake run "$R" open op1 -- --continue
+has "inside tmux open switches rather than nests" "$(logged)" "tmux switch-client -t =proj_op1"
+run "$R" new op2 --none
+run "$R" open op2 --aider -- --preset go
+has "open takes the same agent options as new" "$(logged)" "-c $R/.claude/worktrees/op2 aider-run --preset go"
+run "$R" new op3 --none
+TMUXMODE=never run "$R" open op3 -- --model opus
+has "open with no tmux execs the agent in the tree" "$(logged)" "claude pwd=$R/.claude/worktrees/op3 args=--model opus"
+run "$R" new op4 --none
+TMUXMODE=never run "$R" open op4 --tmux
+has "open --tmux forces a session" "$(logged)" "tmux new-session -d -s proj_op4"
+case "$(logged)" in *"hook "*) bad "open runs no hook" "$(logged)" ;; *) ok "open runs no hook" ;; esac
+
+# A running session is attached, never doubled, and dropped args are said out loud.
+run "$R" open a1 -- --resume abc123
+check "open on a running session exits 0" "$?" 0
+has "attaches to the running session" "$(logged)" "tmux attach -t =proj_a1"
+case "$(logged)" in *"tmux new-session"*) bad "starts no second agent" "$(logged)" ;; *) ok "starts no second agent" ;; esac
+has "and notes the args it ignored" "$(cat "$WORK/err")" "ignored --resume abc123"
+run "$R" open a1
+case "$(cat "$WORK/err")" in *ignored*) bad "no note when no args were given" "$(cat "$WORK/err")" ;; *) ok "no note when no args were given" ;; esac
+
+run "$R" open no-such-tree -- --resume abc123
+[ "$?" != 0 ] && ok "open on an unknown name fails" || bad "open on an unknown name fails" "exit 0"
+has "with the same error rm gives" "$(cat "$WORK/err")" "no worktree called no-such-tree in proj. \`worktree-orchard --trees\` lists them."
+case "$(logged)" in *"tmux new-session"*|*"tmux attach"*|*"switch-client"*|*"claude pwd"*) bad "and starts nothing" "$(logged)" ;; *) ok "and starts nothing" ;; esac
+[ ! -e "$R/.claude/worktrees/no-such-tree" ] && ok "and creates nothing" || bad "and creates nothing" "tree created"
+run "$R" open
+check "open with no name is a usage error" "$?" 2
+run "$R" open plain --none
+check "open --none is a usage error" "$?" 2
+run "$R" open plain stray
+check "open with a stray argument is a usage error" "$?" 2
+
 # === BY and NAME for every creating tool ====================================
 git -C "$R" worktree add -q "$R/.claude/worktrees/by-claude" -b by-claude main 2>/dev/null
 git -C "$R" worktree add -q "$R/.zed/worktrees/zz1/proj" -b by-zed main 2>/dev/null

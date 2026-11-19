@@ -92,6 +92,7 @@ Without `--all`, sessions are limited to the current repo too: a session counts 
 | `new <name> --none` | Stop at the tree; start nothing. |
 | `new <name> -- --model opus` | Anything after `--` is passed to the agent. |
 | `new <name> --tmux` or `--no-tmux` | Force the tmux session on or off for this one tree. |
+| `open <name> -- --resume <id>` | Open this repo's existing tree called `<name>` the way `enter` does, passing anything after `--` to the agent. It takes the same `--agent`, `--NAME`, `--shell`, `--tmux` and `--no-tmux` options as `new`, and the session gets the same `<repo>_<name>` name. If that session is already running, it attaches and prints a note that the agent arguments were ignored. No hooks run. Pair it with `new <name> --none` when files must go into the tree before the agent's first prompt reads them. |
 | `rm <name>` | Tear down this repo's tree called `<name>`, whichever tool made it. Same safety checks as the picker's `x` key. |
 | `rm -f <name>` | Lift a worktree lock first. Claude Code locks a tree for the life of its session. |
 | `salvage [--check \| --block] [<tree>]` | Run the salvage step on its own. See "What happens to my work when a tree is removed?" |
@@ -197,7 +198,7 @@ A complete example is in [`examples/config`](examples/config).
 | `code_root` | `~/code` | Where `--all` looks for repos, one level deep. |
 | `worktree_dir` | `.claude/worktrees` | Where `new` puts trees, relative to the repo's main checkout. The default matches `claude --worktree`, so trees from either tool sit side by side. |
 | `branch_prefix` | `worktree-` | Prefix for the branch `new` creates. |
-| `default_agent` | `claude` | What `enter`, a row number and `new` start. |
+| `default_agent` | `claude` | What `enter`, a row number, `new` and `open` start. |
 | `alt_agent` | none | What the `o` key starts. |
 | `agent.<name>` | `agent.claude = claude` | Defines an agent. The value is a command, split on spaces; anything that needs quoting belongs in a small script the value points at. `shell` is always defined and means your login shell. |
 | `tmux` | `auto` | `auto`, `always` or `never`. See "When does it use tmux?" |
