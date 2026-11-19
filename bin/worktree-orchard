@@ -11,6 +11,8 @@
 #   worktree-orchard --trees      # worktrees only
 #   worktree-orchard --tmux       # tmux sessions only
 #   worktree-orchard new <name>   # new worktree with an agent in it
+#   worktree-orchard open <name> -- --resume <id>
+#                                 # open an existing one, agent args and all
 #   worktree-orchard rm <name>    # tear one down by name, whichever tool made it
 #   worktree-orchard salvage ...  # run the bundled salvage step on its own
 #
@@ -142,6 +144,8 @@ Usage: $PROG [options]
        $PROG N
        $PROG new <name> [--agent NAME | --NAME | --shell | --none]
               [--tmux | --no-tmux] [-- agent args...]
+       $PROG open <name> [--agent NAME | --NAME | --shell]
+              [--tmux | --no-tmux] [-- agent args...]
        $PROG rm [-f] <name>
        $PROG salvage [--check | --block] [<tree>]
 
@@ -175,6 +179,12 @@ Usage: $PROG [options]
                      tree. In tmux mode the agent runs in a tmux session named
                      <repo>_<name>; --tmux and --no-tmux force it either way.
                      Anything after -- goes to the agent
+  open <name>        open the worktree of the current repo called <name>, the
+                     way enter does, with the same agent and tmux options as
+                     new and anything after -- passed to the agent, as in
+                     "$PROG open <name> -- --resume <id>". A session that is
+                     already running is attached, and any agent args are
+                     ignored with a note. Runs no hooks
   rm [-f] <name>     tear down the worktree of the current repo called <name>,
                      whichever tool made it. Confirms first, refuses a dirty
                      tree or unpushed commits, saves gitignored work, and keeps
@@ -287,31 +297,38 @@ salvage_cmd() {
 # here and never reach the option loop below. Each sets a do_* variable that
 # the dispatch section acts on, the same way the picker callbacks do.
 case "${1-}" in
-  new)
+  # `open` takes the same options as `new` except --none, which would make it a
+  # no-op, so the two share this parse rather than keeping two copies of an
+  # option list that has to stay identical. NEW_* serves both.
+  new|open)
+    VERB=$1
     shift
     NEW_NAME="${1-}"
-    case "$NEW_NAME" in ""|-*) echo "$PROG: usage: $PROG new <name> [--agent NAME|--NAME|--shell|--none] [--tmux|--no-tmux] [-- args]" >&2; exit 2 ;; esac
+    if [ "$VERB" = new ]; then AGENT_OPTS="--agent NAME|--NAME|--shell|--none"; else AGENT_OPTS="--agent NAME|--NAME|--shell"; fi
+    case "$NEW_NAME" in ""|-*) echo "$PROG: usage: $PROG $VERB <name> [$AGENT_OPTS] [--tmux|--no-tmux] [-- args]" >&2; exit 2 ;; esac
     shift
     NEW_AGENT=""; NEW_TMUX=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --agent)   NEW_AGENT="${2-}"; [ -n "$NEW_AGENT" ] || { echo "$PROG new: --agent needs a name" >&2; exit 2; }; shift 2 ;;
-        --none)    NEW_AGENT=none; shift ;;
+        --agent)   NEW_AGENT="${2-}"; [ -n "$NEW_AGENT" ] || { echo "$PROG $VERB: --agent needs a name" >&2; exit 2; }; shift 2 ;;
+        --none)
+          [ "$VERB" = new ] || { echo "$PROG open: --none would start nothing; the tree is already there" >&2; exit 2; }
+          NEW_AGENT=none; shift ;;
         --tmux)    NEW_TMUX=1; shift ;;
         --no-tmux) NEW_TMUX=0; shift ;;
         --) shift; break ;;
         # --claude, --shell, and --<name> for any agent the config defines.
         --?*)
           if agent_known "${1#--}"; then NEW_AGENT=${1#--}; shift
-          else echo "$PROG new: unknown option $1 (no agent by that name; agent arguments go after --)" >&2; exit 2
+          else echo "$PROG $VERB: unknown option $1 (no agent by that name; agent arguments go after --)" >&2; exit 2
           fi ;;
-        *) echo "$PROG new: unexpected argument $1 (agent arguments go after --)" >&2; exit 2 ;;
+        *) echo "$PROG $VERB: unexpected argument $1 (agent arguments go after --)" >&2; exit 2 ;;
       esac
     done
     if [ -n "$NEW_AGENT" ] && [ "$NEW_AGENT" != none ] && ! agent_known "$NEW_AGENT"; then
-      echo "$PROG new: no agent called $NEW_AGENT. Define it as agent.$NEW_AGENT in $CONFIG_FILE" >&2; exit 2
+      echo "$PROG $VERB: no agent called $NEW_AGENT. Define it as agent.$NEW_AGENT in $CONFIG_FILE" >&2; exit 2
     fi
-    do_new=1
+    if [ "$VERB" = new ]; then do_new=1; else do_open=1; fi
     ;;
   rm)
     shift
@@ -331,7 +348,7 @@ case "${1-}" in
     ;;
 esac
 
-while [ "${do_new:-}${do_rm:-}" = "" ] && [ $# -gt 0 ]; do
+while [ "${do_new:-}${do_open:-}${do_rm:-}" = "" ] && [ $# -gt 0 ]; do
   case "$1" in
     -i|--interactive) INTERACTIVE=1; DIGIT_OPENS=0; shift ;;
     -ia|--interactive-auto) INTERACTIVE=1; DIGIT_OPENS=1; shift ;;
@@ -369,7 +386,7 @@ case "${exec_preview:-}${emit_rows:-}${do_create:-}${do_teardown:-}${do_rename:-
   "") check_config ;;
 esac
 
-# What enter, a row number and `new` start when nothing more specific is asked
+# What enter, a row number, `new` and `open` start when nothing more specific is asked
 # for. Refused rather than ignored when it names no agent, because a typo here
 # would otherwise start something else with no sign the setting was read.
 DEFAULT_AGENT="${ORCHARD_AGENT:-$(cfg default_agent claude)}"
@@ -1372,8 +1389,12 @@ copy_includes() {  # $1 repo root  $2 new tree
 # `rm <name>`: the one worktree of this repo with that name, torn down the
 # way the x key does it. The main working tree is never a candidate. -f lifts a
 # lock first, because Claude Code locks a tree for the life of its session.
-rm_by_name() {  # $1 name  $2 force: 1|0
-  local name=$1 force=$2 keys n key
+# The row key of the one worktree of this repo called $1, for `rm` and `open`
+# alike, so a name that one of them finds the other finds too, and both refuse
+# a missing or ambiguous name with the same words. The main working tree is
+# never a candidate. $2 says what to do in the picker when the name is shared.
+tree_key_by_name() {  # $1 name  $2 picker hint, e.g. "remove the right one ... x"
+  local name=$1 hint=$2 keys n
   keys=$(awk -v FS="$SEP" -v want="$name" '$1 ~ /^tree:/ && $3 == want && $7 != "-" { print $1 }' "$WORK/trees.tsv")
   n=$(printf '%s\n' "$keys" | grep -c . || true)
   if [ "$n" = 0 ]; then
@@ -1381,11 +1402,16 @@ rm_by_name() {  # $1 name  $2 force: 1|0
     return 1
   fi
   if [ "$n" -gt 1 ]; then
-    echo "$PROG: $n worktrees are called $name; remove the right one from the picker ($PROG -i, then x):" >&2
+    echo "$PROG: $n worktrees are called $name; $hint:" >&2
     printf '%s\n' "$keys" | sed 's/^tree:/    /' >&2
     return 1
   fi
-  key=$keys
+  printf '%s\n' "$keys"
+}
+
+rm_by_name() {  # $1 name  $2 force: 1|0
+  local name=$1 force=$2 key
+  key=$(tree_key_by_name "$name" "remove the right one from the picker ($PROG -i, then x)") || return 1
   if [ "$force" = 1 ] && worktree_locked "${key#tree:}" "$(field_for "$key" 11)" >/dev/null; then
     git -C "$(field_for "$key" 11)" worktree unlock "${key#tree:}" && echo "unlocked $name" >&2
   fi
@@ -1630,6 +1656,36 @@ if [ -n "${do_new:-}" ]; then
   # "$@" is whatever followed --, untouched by the option loop, which the
   # subcommand parse skips.
   launch "$NEW_PATH" "$(basename "$NEW_ROOT")_$NEW_NAME" "$NEW_AGENT" "${NEW_TMUX:-$USE_TMUX}" "$@"
+  exit $?
+fi
+# `open <name>`: what enter does on that tree's row, plus whatever followed --.
+# It exists for the trees whose agent has to start with arguments: resuming a
+# conversation in its own tree, or a tree made with `new --none` so files could
+# go in before the agent's first prompt reads them. The stand-in was a
+# hand-written tmux new-session, which nested when run inside tmux.
+if [ -n "${do_open:-}" ]; then
+  OPEN_ROOT=$(repo_root) || { echo "$PROG: not inside a git repository" >&2; exit 1; }
+  SCOPE=repo; KINDS=trees
+  collect >/dev/null
+  OPEN_KEY=$(tree_key_by_name "$NEW_NAME" "open the right one from the picker ($PROG -i, then enter)") || exit 1
+  OPEN_PATH=${OPEN_KEY#tree:}
+  OPEN_TMUX=${NEW_TMUX:-$USE_TMUX}
+  # The session joined to the row, as enter uses, and failing that the name
+  # this verb would give a new one. launch() would attach to either without
+  # starting the agent, so the args are dropped there; saying so beats letting
+  # `--resume <id>` vanish silently into a session already running something.
+  OPEN_SESS=$(field_for "$OPEN_KEY" 10)
+  if [ -z "$OPEN_SESS" ]; then
+    OPEN_SESS="$(basename "$OPEN_ROOT")_$NEW_NAME"
+    if [ "$OPEN_TMUX" != 1 ] || ! session_exists "$OPEN_SESS"; then OPEN_SESS=""; fi
+  fi
+  if [ -n "$OPEN_SESS" ]; then
+    [ $# -eq 0 ] || echo "$PROG: session $OPEN_SESS is already running, so it was attached and ignored $*" >&2
+    attach_session "$OPEN_SESS"
+    exit $?
+  fi
+  [ -d "$OPEN_PATH" ] || { echo "$PROG: $OPEN_PATH is gone" >&2; exit 1; }
+  launch "$OPEN_PATH" "$(basename "$OPEN_ROOT")_$NEW_NAME" "${NEW_AGENT:-$DEFAULT_AGENT}" "$OPEN_TMUX" "$@"
   exit $?
 fi
 if [ -n "${do_rm:-}" ]; then
