@@ -14,6 +14,9 @@
 #   worktree-orchard open <name> -- --resume <id>
 #                                 # open an existing one, agent args and all
 #   worktree-orchard rm <name>    # tear one down by name, whichever tool made it
+#   worktree-orchard -C ~/code/x new <name> --base origin/main --detach
+#                                 # the same from a script: another repo, a
+#                                 # chosen base, and no attach
 #   worktree-orchard salvage ...  # run the bundled salvage step on its own
 #
 # WHY THIS EXISTS. A worktree and its tmux session are usually the same thing
@@ -49,6 +52,26 @@ set -euo pipefail
 # Messages name the command the way it was invoked, so a symlink or wrapper
 # called `wt` reads as wt everywhere, including the help text.
 PROG=${0##*/}
+
+# The script's own absolute path, fixed before -C can change directory. A
+# relative $0 (bin/worktree-orchard) resolved after the cd would point inside
+# the -C directory, and the picker's callbacks and the salvage lookup would
+# both miss.
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+# -C <path>: behave as if started in <path>, the way `git -C` does, so a script
+# driving several repos never has to cd into each one. It comes before the
+# verb and before every option, and repeats compound, as git's do. An empty
+# path leaves the directory alone, also as git does. Changing the process's
+# own directory, rather than threading a path through every function, is what
+# keeps the names identical: repo_root, the marker for the current tree and
+# the picker's callbacks all read the working directory already.
+while [ "${1-}" = -C ]; do
+  [ $# -ge 2 ] || { echo "$PROG: -C needs a path" >&2; exit 2; }
+  # CDPATH cleared, so a bare name cannot resolve somewhere else and print it.
+  if [ -n "$2" ]; then CDPATH='' cd -- "$2" 2>/dev/null || { echo "$PROG: -C $2: not a directory" >&2; exit 2; }; fi
+  shift 2
+done
 
 # ---------------------------------------------------------------------------
 # Configuration. Flags beat environment variables, which beat the config
@@ -140,14 +163,19 @@ usage() {
   cat <<USAGE
 $PROG: worktrees and tmux sessions, in one list
 
-Usage: $PROG [options]
-       $PROG N
-       $PROG new <name> [--agent NAME | --NAME | --shell | --none]
-              [--tmux | --no-tmux] [-- agent args...]
-       $PROG open <name> [--agent NAME | --NAME | --shell]
-              [--tmux | --no-tmux] [-- agent args...]
-       $PROG rm [-f] <name>
-       $PROG salvage [--check | --block] [<tree>]
+Usage: $PROG [-C <path>] [options]
+       $PROG [-C <path>] N
+       $PROG [-C <path>] new <name>
+              [--agent NAME | --NAME | --shell | --none] [--base REF]
+              [--tmux | --no-tmux | --detach] [-- agent args...]
+       $PROG [-C <path>] open <name>
+              [--agent NAME | --NAME | --shell]
+              [--tmux | --no-tmux | --detach] [-- agent args...]
+       $PROG [-C <path>] rm [-f] <name>
+       $PROG [-C <path>] salvage [--check | --block] [<tree>]
+
+  -C <path>          act as if started in <path>, the way git -C does. It
+                     comes first, before the verb and every other option
 
   -i, --interactive  pick a workspace with fzf and open it. A digit key moves
                      to that row and stops there; enter is what opens
@@ -179,12 +207,21 @@ Usage: $PROG [options]
                      tree. In tmux mode the agent runs in a tmux session named
                      <repo>_<name>; --tmux and --no-tmux force it either way.
                      Anything after -- goes to the agent
+    --base REF       base the branch on REF instead: any commit-ish, such as
+                     origin/main, origin/feature-x or a SHA. The branch is
+                     still made with no upstream
+    --detach         start the tmux session and return without attaching, for
+                     a script with no terminal. It implies tmux mode. It never
+                     starts a tmux server, because a server inherits the
+                     environment of whatever starts it: with none running it
+                     fails and creates nothing
   open <name>        open the worktree of the current repo called <name>, the
                      way enter does, with the same agent and tmux options as
                      new and anything after -- passed to the agent, as in
                      "$PROG open <name> -- --resume <id>". A session that is
                      already running is attached, and any agent args are
-                     ignored with a note. Runs no hooks
+                     ignored with a note. Runs no hooks. --detach works as it
+                     does for new; a running session is then left as it is
   rm [-f] <name>     tear down the worktree of the current repo called <name>,
                      whichever tool made it. Confirms first, refuses a dirty
                      tree or unpushed commits, saves gitignored work, and keeps
@@ -277,7 +314,7 @@ agent_known() { [ -n "$(agent_command "$1")" ]; }
 # how most installs put it on PATH, is followed first so the sibling is found
 # in the real install directory. ORCHARD_SALVAGE overrides, for the harness.
 self_dir() {
-  local f=$0 t
+  local f=$SELF t
   while [ -L "$f" ]; do
     t=$(readlink "$f")
     case "$t" in /*) f=$t ;; *) f=$(dirname "$f")/$t ;; esac
@@ -296,6 +333,7 @@ salvage_cmd() {
 # The subcommands come first and take their own arguments, so they are parsed
 # here and never reach the option loop below. Each sets a do_* variable that
 # the dispatch section acts on, the same way the picker callbacks do.
+DETACH=0            # set by new/open --detach; launch() reads it
 case "${1-}" in
   # `open` takes the same options as `new` except --none, which would make it a
   # no-op, so the two share this parse rather than keeping two copies of an
@@ -304,18 +342,22 @@ case "${1-}" in
     VERB=$1
     shift
     NEW_NAME="${1-}"
-    if [ "$VERB" = new ]; then AGENT_OPTS="--agent NAME|--NAME|--shell|--none"; else AGENT_OPTS="--agent NAME|--NAME|--shell"; fi
-    case "$NEW_NAME" in ""|-*) echo "$PROG: usage: $PROG $VERB <name> [$AGENT_OPTS] [--tmux|--no-tmux] [-- args]" >&2; exit 2 ;; esac
+    if [ "$VERB" = new ]; then AGENT_OPTS="--agent NAME|--NAME|--shell|--none] [--base REF"; else AGENT_OPTS="--agent NAME|--NAME|--shell"; fi
+    case "$NEW_NAME" in ""|-*) echo "$PROG: usage: $PROG $VERB <name> [$AGENT_OPTS] [--tmux|--no-tmux|--detach] [-- args]" >&2; exit 2 ;; esac
     shift
-    NEW_AGENT=""; NEW_TMUX=""
+    NEW_AGENT=""; NEW_TMUX=""; NEW_BASE=""; DETACH=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --agent)   NEW_AGENT="${2-}"; [ -n "$NEW_AGENT" ] || { echo "$PROG $VERB: --agent needs a name" >&2; exit 2; }; shift 2 ;;
         --none)
           [ "$VERB" = new ] || { echo "$PROG open: --none would start nothing; the tree is already there" >&2; exit 2; }
           NEW_AGENT=none; shift ;;
+        --base)
+          [ "$VERB" = new ] || { echo "$PROG open: --base only applies to new; the tree's branch already exists" >&2; exit 2; }
+          NEW_BASE="${2-}"; [ -n "$NEW_BASE" ] || { echo "$PROG new: --base needs a ref" >&2; exit 2; }; shift 2 ;;
         --tmux)    NEW_TMUX=1; shift ;;
         --no-tmux) NEW_TMUX=0; shift ;;
+        --detach)  DETACH=1; shift ;;
         --) shift; break ;;
         # --claude, --shell, and --<name> for any agent the config defines.
         --?*)
@@ -327,6 +369,14 @@ case "${1-}" in
     done
     if [ -n "$NEW_AGENT" ] && [ "$NEW_AGENT" != none ] && ! agent_known "$NEW_AGENT"; then
       echo "$PROG $VERB: no agent called $NEW_AGENT. Define it as agent.$NEW_AGENT in $CONFIG_FILE" >&2; exit 2
+    fi
+    # --detach is a tmux session nobody attaches to, so it implies tmux mode,
+    # and the two combinations that contradict it are refused rather than one
+    # side silently winning.
+    if [ "$DETACH" = 1 ]; then
+      [ "$NEW_TMUX" = 0 ] && { echo "$PROG $VERB: --detach starts a tmux session, so it cannot go with --no-tmux" >&2; exit 2; }
+      [ "$NEW_AGENT" = none ] && { echo "$PROG $VERB: --detach starts a session, and --none starts nothing" >&2; exit 2; }
+      NEW_TMUX=1
     fi
     if [ "$VERB" = new ]; then do_new=1; else do_open=1; fi
     ;;
@@ -1266,6 +1316,13 @@ launch() {  # $1 path  $2 session  $3 agent  $4 tmux: 1|0  [agent args...]
         tmux new-session -d -s "$sess" -c "$path" "$@" || return 1
       fi
     fi
+    # --detach stops here. The attach is what failed from a script: with no
+    # terminal it errors after the session already exists, so the caller saw a
+    # failure for something that had worked.
+    if [ "$DETACH" = 1 ]; then
+      echo "session $sess is running, not attached. Attach with: tmux attach -t =$sess" >&2
+      return 0
+    fi
     attach_session "$sess"
   else
     cd "$path" || return 1
@@ -1274,6 +1331,19 @@ launch() {  # $1 path  $2 session  $3 agent  $4 tmux: 1|0  [agent args...]
     [ -n "${ORCHARD_WORK_DIR:-}" ] || rm -rf "$WORK"
     exec "$@"
   fi
+}
+
+# --detach uses a tmux server that is already running and never starts one. A
+# server takes the environment of the process that starts it and hands it to
+# every pane created afterwards, so a script's environment (its tokens, a
+# sandbox's PATH) would leak into sessions it never meant to touch.
+# list-sessions asks a server and, unlike new-session, does not start one. A
+# server that exits between this check and new-session would let new-session
+# start one; that window is the gap between two commands.
+require_tmux_server() {
+  tmux list-sessions >/dev/null 2>&1 && return 0
+  echo "$PROG: --detach: no tmux server is running, and --detach never starts one, because a server inherits the environment of whatever starts it. Start one first (tmux new-session -d), then rerun. Nothing was created." >&2
+  return 1
 }
 
 attach_session() {  # $1 name
@@ -1321,8 +1391,8 @@ create_worktree() {  # $1 mode: session|bare
 
 # The one creation path. `new` and the n and t keys all come through here, so
 # a tree is the same tree whichever way it was asked for. Sets NEW_PATH.
-make_tree() {  # $1 repo root  $2 name
-  local root=$1 name=$2 path base baseref branch
+make_tree() {  # $1 repo root  $2 name  [$3 base: any commit-ish, from new --base]
+  local root=$1 name=$2 want=${3-} path base baseref branch
   # A dot is rejected, not merely discouraged: tmux reads it as the separator
   # in "session:window.pane", so a worktree called my.feature either fails to
   # get a session or gets one named my_feature, which can never rejoin its row.
@@ -1339,8 +1409,22 @@ make_tree() {  # $1 repo root  $2 name
   # HEAD is whatever the main checkout happens to be sitting on, so a new tree
   # would silently inherit an unrelated feature branch. The base is printed
   # either way, so the choice is never silent.
-  base=$(default_branch "$root" 2>/dev/null || true)
-  [ -n "$base" ] || base=HEAD
+  #
+  # new --base overrides that with any commit-ish, remote-tracking refs
+  # included: --no-track is what keeps git from writing upstream config, so
+  # origin/main is as safe a base as main. It exists because a local main in a
+  # checkout nobody pulls goes stale. It is checked before anything is made, so
+  # a typo creates neither tree nor branch, and a leading dash is refused so
+  # the ref can never be read as an option to worktree add.
+  if [ -n "$want" ]; then
+    case "$want" in -*) echo "$PROG: --base $want is not a ref" >&2; return 1 ;; esac
+    git -C "$root" rev-parse --verify --quiet "$want^{commit}" >/dev/null 2>&1 \
+      || { echo "$PROG: --base $want names no commit in $(basename "$root")" >&2; return 1; }
+    base=$want
+  else
+    base=$(default_branch "$root" 2>/dev/null || true)
+    [ -n "$base" ] || base=HEAD
+  fi
   baseref=$(git -C "$root" rev-parse --short "$base" 2>/dev/null || echo '?')
   git -C "$root" worktree add --no-track -b "$branch" "$path" "$base" >&2 || return 1
   echo "created $path on branch $branch, based on $base ($baseref)" >&2
@@ -1650,7 +1734,9 @@ if [ -n "${emit_prompt:-}" ];  then load_toggle; printf '%s %s/%s> ' "$PROG" "$K
 # ---------------------------------------------------------------------------
 if [ -n "${do_new:-}" ]; then
   NEW_ROOT=$(repo_root) || { echo "$PROG: not inside a git repository" >&2; exit 1; }
-  make_tree "$NEW_ROOT" "$NEW_NAME" || exit 1
+  # Before the tree, so a refusal leaves nothing behind for the caller to undo.
+  if [ "$DETACH" = 1 ]; then require_tmux_server || exit 1; fi
+  make_tree "$NEW_ROOT" "$NEW_NAME" "$NEW_BASE" || exit 1
   NEW_AGENT=${NEW_AGENT:-$DEFAULT_AGENT}
   [ "$NEW_AGENT" = none ] && exit 0
   # "$@" is whatever followed --, untouched by the option loop, which the
@@ -1665,6 +1751,7 @@ fi
 # hand-written tmux new-session, which nested when run inside tmux.
 if [ -n "${do_open:-}" ]; then
   OPEN_ROOT=$(repo_root) || { echo "$PROG: not inside a git repository" >&2; exit 1; }
+  if [ "$DETACH" = 1 ]; then require_tmux_server || exit 1; fi
   SCOPE=repo; KINDS=trees
   collect >/dev/null
   OPEN_KEY=$(tree_key_by_name "$NEW_NAME" "open the right one from the picker ($PROG -i, then enter)") || exit 1
@@ -1680,6 +1767,11 @@ if [ -n "${do_open:-}" ]; then
     if [ "$OPEN_TMUX" != 1 ] || ! session_exists "$OPEN_SESS"; then OPEN_SESS=""; fi
   fi
   if [ -n "$OPEN_SESS" ]; then
+    if [ "$DETACH" = 1 ]; then
+      if [ $# -eq 0 ]; then echo "$PROG: session $OPEN_SESS is already running; left it detached" >&2
+      else echo "$PROG: session $OPEN_SESS is already running, so it was left detached and ignored $*" >&2; fi
+      exit 0
+    fi
     [ $# -eq 0 ] || echo "$PROG: session $OPEN_SESS is already running, so it was attached and ignored $*" >&2
     attach_session "$OPEN_SESS"
     exit $?
@@ -1801,7 +1893,7 @@ fi
 [ "$LIST_COLS" -lt 30 ] && LIST_COLS=30
 compute_widths "$LIST_COLS" "$SORTED"
 
-SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+# SELF is set at the top, before -C can move the working directory.
 export ORCHARD_WORK_DIR="$WORK" ORCHARD_CODE_ROOT="$CODE_ROOT" ORCHARD_LIST_COLS="$LIST_COLS"
 printf '%s\n%s\n' "$KINDS" "$SCOPE" > "$WORK/state"
 RELOAD="'$SELF' --rows"

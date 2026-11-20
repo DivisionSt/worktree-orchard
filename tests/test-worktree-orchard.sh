@@ -53,7 +53,9 @@ case "$1" in
   has-session) grep -qxF "${3#=}" "$ORCHARD_TEST_SESS" 2>/dev/null ;;
   new-session) printf '%s\n' "$4" >> "$ORCHARD_TEST_SESS" ;;
   kill-session) grep -vxF "${3#=}" "$ORCHARD_TEST_SESS" > "$ORCHARD_TEST_SESS.new" 2>/dev/null; mv "$ORCHARD_TEST_SESS.new" "$ORCHARD_TEST_SESS" ;;
-  list-sessions) exit 1 ;;
+  # No server unless the test says one is running, so --detach can be tested
+  # both ways. collect() reads this too and copes with either answer.
+  list-sessions) [ -n "${ORCHARD_TEST_SERVER_UP:-}" ] ;;
   *) exit 0 ;;
 esac
 STUB
@@ -70,6 +72,7 @@ cat > "$CONF" <<'CONF'
 
 agent.aider = aider-run
 agent.fast = fakeagent --fast
+agent.sleeper = sleep
 alt_agent = aider
 salvage_keep = HANDOFF.md tmp
 hook.post_create = printf 'hook post_create %s %s %s\n' "$1" "$2" "$3" >> "$ORCHARD_TEST_LOG"
@@ -79,7 +82,7 @@ CONF
 export PATH="$WORK/stub:$PATH" HOME="$WORK/home" SHELL="$WORK/stub/fakeshell"
 export ORCHARD_TEST_LOG="$LOG" ORCHARD_TEST_SESS="$SESS" ORCHARD_NO_HOLD=1 NO_COLOR=1
 export ORCHARD_CODE_ROOT="$WORK/code"
-unset TMUX ORCHARD_AGENT ORCHARD_WORK_DIR ORCHARD_PICKER_DRY_RUN ORCHARD_TMUX ORCHARD_CONFIG ORCHARD_NO_HOOKS ORCHARD_SALVAGE XDG_CONFIG_HOME SSH_CONNECTION SSH_TTY
+unset ORCHARD_TEST_SERVER_UP TMUX ORCHARD_AGENT ORCHARD_WORK_DIR ORCHARD_PICKER_DRY_RUN ORCHARD_TMUX ORCHARD_CONFIG ORCHARD_NO_HOOKS ORCHARD_SALVAGE XDG_CONFIG_HOME SSH_CONNECTION SSH_TTY
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$WORK/gitconfig"
 printf '[user]\n\temail = t@t\n\tname = t\n[init]\n\tdefaultBranch = main\n' > "$GIT_CONFIG_GLOBAL"
 
@@ -240,6 +243,86 @@ check "open --none is a usage error" "$?" 2
 run "$R" open plain stray
 check "open with a stray argument is a usage error" "$?" 2
 
+# === -C: act on another repo from anywhere =====================================
+# A script driving several repos should not have to cd into each one. -C makes
+# every verb behave as if started in that directory, the way git -C does.
+git -C "$WORK/code" init -q other
+git -C "$WORK/code/other" commit -q --allow-empty -m init
+O="$WORK/code/other"
+mkdir -p "$WORK/nowhere"
+run "$WORK/nowhere" -C "$O" new c1 --none
+check "-C new exits 0 from outside any repo" "$?" 0
+[ -d "$O/.claude/worktrees/c1" ] && ok "-C puts the tree in that repo" || bad "-C puts the tree in that repo" "$(cat "$WORK/err")"
+check "with the branch name it would get from inside" "$(git -C "$O/.claude/worktrees/c1" branch --show-current 2>&1)" worktree-c1
+run "$R" -C "$O" new c2
+has "-C names the session for that repo, even from inside another" "$(logged)" "tmux new-session -d -s other_c2 -c $O/.claude/worktrees/c2 claude"
+[ ! -e "$R/.claude/worktrees/c2" ] && ok "and makes nothing in the repo it was run from" || bad "and makes nothing in the repo it was run from" "tree in proj"
+run "$WORK/code" -C other open c1 -- --resume x
+has "-C takes a path relative to where it was run" "$(logged)" "-s other_c1 -c $O/.claude/worktrees/c1 claude --resume x"
+run "$WORK/nowhere" -C "$O" --trees
+has "-C works for the table too" "$(cat "$WORK/out")" "c1"
+run "$WORK/nowhere" -C "$WORK/no-such-dir" new c3 --none
+check "-C to a missing directory is a usage error" "$?" 2
+has "and says which" "$(cat "$WORK/err")" "-C $WORK/no-such-dir"
+run "$WORK/nowhere" -C
+check "-C with no path is a usage error" "$?" 2
+# Run by a relative path, the script must still find itself after -C moves it.
+: > "$LOG"
+(cd "$WORK" && ORCHARD_PICKER_DRY_RUN=1 ORCHARD_TMUX=always bash app/worktree-orchard -C code/proj -i) > "$WORK/out" 2> "$WORK/err"
+has "a relative \$0 still reaches the picker callbacks after -C" "$(grep -a '^fzf-args' "$WORK/out")" "'$WORK/app/worktree-orchard' --rows"
+
+# === new --base: choose what the branch starts from ===========================
+# A remote-tracking base is safe because the branch is made with --no-track,
+# which is what keeps git from writing upstream config (and needing config.lock).
+git -C "$R" update-ref refs/remotes/origin/feature-x some-feature
+FEAT_SHA=$(git -C "$R" rev-parse --short some-feature)
+run "$R" new b1 --base origin/feature-x --none
+check "new --base exits 0" "$?" 0
+check "the branch starts at the base" "$(git -C "$R/.claude/worktrees/b1" rev-parse --short HEAD 2>&1)" "$FEAT_SHA"
+check "and writes no branch config" "$(git -C "$R" config --get-regexp '^branch\.worktree-b1\.' || true)" ""
+has "and prints the base it used" "$(cat "$WORK/err")" "based on origin/feature-x ($FEAT_SHA)"
+run "$R" new b2 --base origin/main --none
+check "--base origin/main gives origin/main's commit" "$(git -C "$R/.claude/worktrees/b2" rev-parse --short HEAD 2>&1)" "$MAIN_SHA"
+check "with no upstream either" "$(git -C "$R" config --get-regexp '^branch\.worktree-b2\.' || true)" ""
+run "$R" new b3 --base no-such-ref --none
+[ "$?" != 0 ] && ok "a base that names no commit is refused" || bad "a base that names no commit is refused" "exit 0"
+[ ! -e "$R/.claude/worktrees/b3" ] && ! git -C "$R" rev-parse -q --verify worktree-b3 >/dev/null && ok "and creates neither tree nor branch" || bad "and creates neither tree nor branch" "something made"
+run "$R" new b4 --base
+check "--base with no ref is a usage error" "$?" 2
+run "$R" open plain --base main
+check "open --base is a usage error" "$?" 2
+
+# === --detach: start the session, attach to nothing, never start a server =====
+ORCHARD_TEST_SERVER_UP=1 TMUXMODE=never run "$R" new d1 --detach -- --resume z
+check "new --detach exits 0 with a server running" "$?" 0
+has "it starts the session, implying tmux mode" "$(logged)" "tmux new-session -d -s proj_d1 -c $R/.claude/worktrees/d1 claude --resume z"
+case "$(logged)" in *"tmux attach"*|*"switch-client"*) bad "and attaches nothing" "$(logged)" ;; *) ok "and attaches nothing" ;; esac
+has "and says how to attach" "$(cat "$WORK/err")" "tmux attach -t =proj_d1"
+TMUX=fake ORCHARD_TEST_SERVER_UP=1 run "$R" new d2 --detach
+case "$(logged)" in *"switch-client"*) bad "inside tmux --detach does not switch either" "$(logged)" ;; *) ok "inside tmux --detach does not switch either" ;; esac
+run "$R" new d3 --detach
+[ "$?" != 0 ] && ok "new --detach with no server fails" || bad "new --detach with no server fails" "exit 0"
+has "and says to start one" "$(cat "$WORK/err")" "no tmux server is running"
+[ ! -e "$R/.claude/worktrees/d3" ] && ! git -C "$R" rev-parse -q --verify worktree-d3 >/dev/null && ok "and creates no tree or branch" || bad "and creates no tree or branch" "something made"
+case "$(logged)" in *"new-session"*) bad "and starts no session, so no server" "$(logged)" ;; *) ok "and starts no session, so no server" ;; esac
+run "$R" new d4 --detach --no-tmux
+check "--detach with --no-tmux is a usage error" "$?" 2
+run "$R" new d5 --none --detach
+check "--detach with --none is a usage error" "$?" 2
+run "$R" new od1 --none
+ORCHARD_TEST_SERVER_UP=1 run "$R" open od1 --detach -- --continue
+check "open --detach exits 0" "$?" 0
+has "and starts the agent with its args" "$(logged)" "tmux new-session -d -s proj_od1 -c $R/.claude/worktrees/od1 claude --continue"
+case "$(logged)" in *"tmux attach"*|*"switch-client"*) bad "without attaching" "$(logged)" ;; *) ok "without attaching" ;; esac
+ORCHARD_TEST_SERVER_UP=1 run "$R" open od1 --detach -- --again
+check "open --detach on a running session exits 0" "$?" 0
+case "$(logged)" in *"tmux attach"*|*"switch-client"*|*"new-session"*) bad "and neither attaches nor starts a second agent" "$(logged)" ;; *) ok "and neither attaches nor starts a second agent" ;; esac
+has "and notes the args it ignored" "$(cat "$WORK/err")" "ignored --again"
+run "$R" new od2 --none
+run "$R" open od2 --detach
+[ "$?" != 0 ] && ok "open --detach with no server fails" || bad "open --detach with no server fails" "exit 0"
+case "$(logged)" in *"new-session"*) bad "and starts nothing" "$(logged)" ;; *) ok "and starts nothing" ;; esac
+
 # === BY and NAME for every creating tool ====================================
 git -C "$R" worktree add -q "$R/.claude/worktrees/by-claude" -b by-claude main 2>/dev/null
 git -C "$R" worktree add -q "$R/.zed/worktrees/zz1/proj" -b by-zed main 2>/dev/null
@@ -306,7 +389,17 @@ if [ -n "$REAL_TMUX" ] && "$REAL_TMUX" -S "$RSOCK" new-session -d -s probe sleep
   check "a session beside the repo's trees but in none is not" "$(row_of "sess:emdash-orphan-xyz")" ""
   check "--all lists another repo's session" "$(awk -v FS="$(printf '\037')" '$1 == "sess:unrelated" { print $2 "|" $10 }' "$WORK/wd4/trees.tsv")" "▸|unrelated"
   check "a differently named session in a tree joins it too" "$(row_of "tree:$R/.claude/worktrees/by-claude")" "●|bare-in-by-git"
+  # --detach against a real server. The attach used to fail with no terminal
+  # after the session already existed, so the exit status lied; stdin here is
+  # /dev/null, which is that case.
+  PATH="$WORK/rtmux:$PATH" run "$R" new rd1 --agent sleeper --detach -- 600
+  check "against real tmux, --detach with no terminal exits 0" "$?" 0
+  "$REAL_TMUX" -S "$RSOCK" has-session -t =proj_rd1 2>/dev/null && ok "and the session is running" || bad "and the session is running" "$(cat "$WORK/err")"
   "$REAL_TMUX" -S "$RSOCK" kill-server 2>/dev/null || true
+  PATH="$WORK/rtmux:$PATH" run "$R" new rd2 --agent sleeper --detach -- 600
+  [ "$?" != 0 ] && ok "with no real server, --detach fails" || bad "with no real server, --detach fails" "exit 0"
+  "$REAL_TMUX" -S "$RSOCK" list-sessions >/dev/null 2>&1 && bad "and starts no server" "a server is running" || ok "and starts no server"
+  [ ! -e "$R/.claude/worktrees/rd2" ] && ok "and makes no tree" || bad "and makes no tree" "tree made"
 else
   printf 'SKIP  session join against a real tmux: no tmux server could start here\n'
 fi
