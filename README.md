@@ -92,16 +92,35 @@ Without `--all`, sessions are limited to the current repo too: a session counts 
 | `new <name> --none` | Stop at the tree; start nothing. |
 | `new <name> -- --model opus` | Anything after `--` is passed to the agent. |
 | `new <name> --tmux` or `--no-tmux` | Force the tmux session on or off for this one tree. |
-| `open <name> -- --resume <id>` | Open this repo's existing tree called `<name>` the way `enter` does, passing anything after `--` to the agent. It takes the same `--agent`, `--NAME`, `--shell`, `--tmux` and `--no-tmux` options as `new`, and the session gets the same `<repo>_<name>` name. If that session is already running, it attaches and prints a note that the agent arguments were ignored. No hooks run. Pair it with `new <name> --none` when files must go into the tree before the agent's first prompt reads them. |
+| `new <name> --base origin/main` | Base the branch on any commit-ish instead of the local default branch: `origin/main`, `origin/feature-x`, or a SHA. The branch is still created with `--no-track`, so it has no upstream. A ref that names no commit is refused before anything is created. |
+| `new <name> --detach` | Start the tmux session and return without attaching. See "How do I drive it from a script?" |
+| `open <name> -- --resume <id>` | Open this repo's existing tree called `<name>` the way `enter` does, passing anything after `--` to the agent. It takes the same `--agent`, `--NAME`, `--shell`, `--tmux`, `--no-tmux` and `--detach` options as `new`, and the session gets the same `<repo>_<name>` name. If that session is already running, it attaches and prints a note that the agent arguments were ignored. No hooks run. Pair it with `new <name> --none` when files must go into the tree before the agent's first prompt reads them. |
 | `rm <name>` | Tear down this repo's tree called `<name>`, whichever tool made it. Same safety checks as the picker's `x` key. |
 | `rm -f <name>` | Lift a worktree lock first. Claude Code locks a tree for the life of its session. |
 | `salvage [--check \| --block] [<tree>]` | Run the salvage step on its own. See "What happens to my work when a tree is removed?" |
 
 Names take letters, digits, `_` and `-` only. A dot is refused because tmux reads `.` as the pane separator in `session:window.pane`, so a tree called `my.feature` would get a session it could never rejoin.
 
-New trees are based on the repo's default branch (whatever `origin/HEAD` points at, as a local branch), not on whatever the main checkout happens to have checked out, and the base is printed when the tree is made. They are created with `--no-track`, so they have no upstream until you push them.
+New trees are based on the repo's default branch (whatever `origin/HEAD` points at, as a local branch), not on whatever the main checkout happens to have checked out, and the base is printed when the tree is made. They are created with `--no-track`, so they have no upstream until you push them. A local default branch in a checkout nobody pulls goes stale, so new trees start behind; `--base origin/main` starts from the remote's copy instead.
 
 If the worktree directory sits inside your checkout and the repo does not already ignore it, `new` adds it to `.git/info/exclude`, the repo's local, uncommitted ignore file, and says so. Otherwise every new tree would show up as untracked in the main checkout.
+
+## How do I drive it from a script?
+
+Three flags exist so a script can create trees and start agents across several repos without a terminal:
+
+| Flag | What it does |
+|---|---|
+| `-C <path>` | Act as if started in `<path>`, the way `git -C` does. It comes first, before the verb, and works for every verb and the table. Tree, branch and session names come out exactly as they would from inside that repo. |
+| `new --base <ref>` | Choose what the new branch starts from. See "Making and removing trees". |
+| `--detach` | For `new` and `open`. Create the tmux session and exit 0 without attaching, which is what fails with no terminal. It implies tmux mode. |
+
+`--detach` never starts a tmux server. A server inherits the environment of the process that starts it and passes it to every pane created afterwards, so a script's environment would leak into sessions it never meant to touch. With no server running, `--detach` exits non-zero, says to start one, and creates nothing: no tree, no branch, no session. `open --detach` on a session that is already running leaves it as it is and exits 0.
+
+```bash
+tmux new-session -d -s base 2>/dev/null || true   # once, from your own shell
+worktree-orchard -C ~/code/api new fix-auth --base origin/main --detach -- "fix the auth bug"
+```
 
 ## How does the picker work?
 
