@@ -160,6 +160,8 @@ The preview pane shows the tree's path and branch, any `salvage_keep` files park
 | `BY` | Who made the worktree: `orchard`, `claude`, `zed`, `paseo`, `emdash`, `git`, or a label you defined. |
 | `AGE` | Since the session started, or since the worktree directory last changed. Not creation time. |
 
+Each repo has its own colour: `REPO` in the full shade and `NAME` in a lighter tint of it. The hue comes from a hash of the repo's folder name, so a repo keeps its colour in every scope and on every run. Two repos can share one. It needs a terminal with 24-bit colour, and it sits beside the state and `GIT` colours, which still carry their meaning.
+
 There is no branch column: on nearly every row it repeated the name, so the preview pane shows the branch instead. emdash's own `emdash-` folder prefix is dropped from `NAME`, since `BY` already says emdash.
 
 A session joins a tree's row when it is named `<repo>_<name>` and actually sits in that tree, or, failing that, when any session sits exactly in the tree's directory. That second rule is what lets tools that name their own sessions still show as one row per workspace.

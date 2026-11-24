@@ -451,6 +451,25 @@ if [ -n "$U8" ]; then
 else
   printf 'SKIP  row widths: no UTF-8 locale here\n'
 fi
+# Per-repo colour: one 24-bit hue per repo, picked by a hash of the repo's
+# folder name so it is the same in every scope and in cmux-berth. The repo
+# column takes the full shade, the name the tint; the state and git colours
+# still carry their meaning; NO_COLOR turns all of it off.
+pal="122;162;247 180;200;250|158;206;106 198;227;168|255;158;100 255;198;165|187;154;247 217;198;251|125;207;255 184;230;255|224;175;104 238;211;168|247;118;142 250;179;192|115;218;202 176;235;226"
+sum=$(printf 'proj' | cksum); sum=${sum%% *}
+IFS='|' read -r -a pairs <<< "$pal"; pair=${pairs[$(( sum % 8 ))]}
+full="38;2;${pair%% *}m"; tint="38;2;${pair##* }m"
+colored_rows() { (cd "$R" && unset NO_COLOR && ORCHARD_LIST_COLS=140 ORCHARD_WORK_DIR="$WORK/wd3" orch "$@" --rows 2>/dev/null | tr '\0' '\n'); }
+all=$(colored_rows --all)
+has "--all colours the repo column in the repo's hashed hue" "$all" "$full"proj
+has "and the name in the lighter tint of the same hue" "$all" "${tint}long-descriptive-worktree-name-here"
+has "the state glyph keeps its own colour" "$all" "$(printf '\033[32m')●"
+has "one-repo scope still tints the name" "$(colored_rows)" "${tint}long-descriptive-worktree-name-here"
+has "narrow rows tint the name too" "$(cd "$R" && unset NO_COLOR && ORCHARD_LIST_COLS=41 ORCHARD_WORK_DIR="$WORK/wd3" orch --rows 2>/dev/null | tr '\0' '\n')" "${tint}long"
+case "$(cd "$R" && ORCHARD_LIST_COLS=140 ORCHARD_WORK_DIR="$WORK/wd3" orch --all --rows 2>/dev/null)" in
+  *"38;2;"*) bad "NO_COLOR turns the repo colours off" "24-bit code present" ;;
+  *) ok "NO_COLOR turns the repo colours off" ;;
+esac
 # Only the shown text: field 1 of a row is its key, which holds the whole path.
 shown_at() { rows_at "$1" | tr '\0' '\n' | awk -F'\t' '{ print $NF }'; }
 case "$(shown_at 41)" in *"long-descriptive-worktree-name-here"*) bad "a narrow row clips a name that cannot fit" "full name shown" ;; *) ok "a narrow row clips a name that cannot fit" ;; esac
