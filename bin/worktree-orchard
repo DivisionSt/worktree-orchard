@@ -952,6 +952,34 @@ state_color() {  # $1 glyph
   esac
 }
 
+# Per-repo colour. Each repo takes one hue from a fixed palette of eight
+# 24-bit colours chosen for a dark background, the same palette cmux-berth's
+# picker uses: the full shade for the repo column, a lighter tint of it for
+# the name. The hue comes from a hash of the repo's folder name (cksum, modulo
+# eight), not from its position in the list, so a repo is the same colour in
+# every scope, in both tools, and on every run; two repos can share a hue.
+# These ride beside the state and git colours, never instead of them: those
+# carry meaning, this only groups rows. Off whenever COLOR is.
+# Sets REPO_FULL, REPO_TINT and REPO_END rather than printing them, so a row
+# costs no subshell beyond the one cksum, and a run of rows from the same repo
+# reuses the last answer.
+REPO_PALETTE="122;162;247 180;200;250|158;206;106 198;227;168|255;158;100 255;198;165|187;154;247 217;198;251|125;207;255 184;230;255|224;175;104 238;211;168|247;118;142 250;179;192|115;218;202 176;235;226"
+REPO_FULL=""; REPO_TINT=""; REPO_END=""; _hue_repo=""
+repo_hue() {  # $1 repo folder name, or - or empty for none
+  [ "$1" = "$_hue_repo" ] && [ -n "$1" ] && return 0
+  _hue_repo=$1; REPO_FULL=""; REPO_TINT=""; REPO_END=""
+  [ "$COLOR" = 1 ] && [ -n "$1" ] && [ "$1" != "-" ] || return 0
+  local sum idx pairs pair
+  sum=$(printf '%s' "$1" | cksum) || return 0
+  sum=${sum%% *}
+  idx=$(( sum % 8 ))
+  IFS='|' read -r -a pairs <<< "$REPO_PALETTE"
+  pair=${pairs[$idx]}
+  REPO_FULL=$(printf '\033[38;2;%sm' "${pair%% *}")
+  REPO_TINT=$(printf '\033[38;2;%sm' "${pair##* }")
+  REPO_END=$C_RESET
+}
+
 git_color() {  # $1 dirty field
   case "$1" in
     clean)             printf '%s' "$C_DIM" ;;
@@ -978,12 +1006,13 @@ row_line() {  # num state name branch dirty ab by age path root
     stacked_row "$num" "$marker" "$state" "$name" "$dirty" "$ab" "$by" "$age" "$root"
     return
   fi
+  # The repo root travels in field 11 of the record, so naming the repo costs
+  # nothing here. A session row has no worktree behind it and shows a dash.
+  local repo="-"
+  [ -n "$root" ] && repo=${root##*/}
+  repo_hue "$repo"
   if [ "$W_REPO" != 0 ]; then
-    # The repo root travels in field 11 of the record, so naming the repo costs
-    # nothing here. A session row has no worktree behind it and shows a dash.
-    local repo="-"
-    [ -n "$root" ] && repo=${root##*/}
-    repocol="$(pad "$(fit "$repo" "$W_REPO")" "$W_REPO") "
+    repocol="$REPO_FULL$(pad "$(fit "$repo" "$W_REPO")" "$W_REPO")$REPO_END "
   fi
   local synccol="" bycol=""
   [ "$W_SYNC" != 0 ] && synccol="$(pad "$ab" "$W_SYNC") "
@@ -997,7 +1026,7 @@ row_line() {  # num state name branch dirty ab by age path root
     "$C_BOLD" "$marker" "$C_RESET" \
     "$(state_color "$state")" "$state" "$C_RESET" \
     "$repocol" \
-    "$(pad "$(fit "$name" "$W_NAME")" "$W_NAME")" \
+    "$REPO_TINT$(pad "$(fit "$name" "$W_NAME")" "$W_NAME")$REPO_END" \
     "$(git_color "$dirty")" "$(pad "$dirty" "$GITW")" "$C_RESET" \
     "$synccol" "$bycol" "$age"
 }
@@ -1012,11 +1041,14 @@ stacked_row() {  # num marker state name dirty ab by age root
   local indent="        "   # eight columns: under the name, past number, marker and state
   local nw=$(( STACK_W - 8 - 1 - W_AGE ))   # less one space and the age
   [ "$nw" -lt 8 ] && nw=8
+  local repo="-"
+  [ -n "$root" ] && repo=${root##*/}
+  repo_hue "$repo"
   printf '%s%2s%s %s%s%s %s%s%s  %s %s\n' \
     "$C_DIM" "$num" "$C_RESET" \
     "$C_BOLD" "$marker" "$C_RESET" \
     "$(state_color "$state")" "$state" "$C_RESET" \
-    "$(pad "$(fit "$name" "$nw")" "$nw")" "$age"
+    "$REPO_TINT$(pad "$(fit "$name" "$nw")" "$nw")$REPO_END" "$age"
   if [ "$state" = "▸" ]; then
     printf '%s%stmux session, no worktree%s\n' "$indent" "$C_DIM" "$C_RESET"
     return
@@ -1028,7 +1060,7 @@ stacked_row() {  # num marker state name dirty ab by age root
     room=$(( STACK_W - 8 - ${#meta} - 2 ))
     # Too little room means no repo at all, never a clipped one that reads as a
     # different repo.
-    [ "$room" -ge 6 ] && tail="  $(fit "${root##*/}" "$room")"
+    [ "$room" -ge 6 ] && tail="  $REPO_FULL$(fit "${root##*/}" "$room")$REPO_END"
   fi
   printf '%s%s%s%s%s%s%s%s\n' "$indent" \
     "$(git_color "$dirty")" "$dirty" "$C_RESET" "$C_DIM" "${meta#"$dirty"}" "$tail" "$C_RESET"
