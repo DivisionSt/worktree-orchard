@@ -96,7 +96,7 @@ Without `--all`, sessions are limited to the current repo too: a session counts 
 | `new <name> --detach` | Start the tmux session and return without attaching. See "How do I drive it from a script?" |
 | `open <name> -- --resume <id>` | Open this repo's existing tree called `<name>` the way `enter` does, passing anything after `--` to the agent. It takes the same `--agent`, `--NAME`, `--shell`, `--tmux`, `--no-tmux` and `--detach` options as `new`, and the session gets the same `<repo>_<name>` name. If that session is already running, it attaches and prints a note that the agent arguments were ignored. No hooks run. Pair it with `new <name> --none` when files must go into the tree before the agent's first prompt reads them. |
 | `rm <name>` | Tear down this repo's tree called `<name>`, whichever tool made it. Same safety checks as the picker's `x` key. |
-| `rm -f <name>` | Lift a worktree lock first. Claude Code locks a tree for the life of its session. |
+| `rm -f <name>` | Lift a worktree lock first, and override a `pre_remove` hook's refusal. Claude Code locks a tree for the life of its session. |
 | `salvage [--check \| --block] [<tree>]` | Run the salvage step on its own. See "What happens to my work when a tree is removed?" |
 
 Names take letters, digits, `_` and `-` only. A dot is refused because tmux reads `.` as the pane separator in `session:window.pane`, so a tree called `my.feature` would get a session it could never rejoin.
@@ -183,7 +183,7 @@ The reasoning behind `auto`: on a machine you reach over SSH, a dropped connecti
 Removing a worktree deletes three kinds of work that exist nowhere else: uncommitted changes, commits no remote has, and gitignored files. `rm` and the `x` key protect each one, in this order:
 
 1. A tree with uncommitted changes is refused. Commit or discard first.
-2. A locked tree is refused, with the `rm -f` command to unlock it.
+2. Your `pre_remove` hook runs, if you set one, and a nonzero exit refuses the removal, naming `rm -f` to override it. Then a locked tree is refused, with the `rm -f` command to unlock it.
 3. A tree with commits no remote has is refused. Push first.
 4. You confirm.
 5. The salvage step copies gitignored files worth keeping into the main checkout's `tmp/salvage/<tree>-<time>/`. Those are the paths in your `salvage_keep` setting, plus any `.worktreeinclude` file whose copy in the tree differs from the main checkout's. Each salvage folder has a `SALVAGE.txt` that says how to restore what it holds.
@@ -240,11 +240,12 @@ creator.conductor = ~/conductor/workspaces/*
 
 ## How do hooks work?
 
-A hook is a shell command in the config file. It runs with `sh -c`, so it can hold a pipe, and its arguments arrive as `$1`, `$2` and so on. A hook that fails is reported and otherwise ignored: it never stops a tree being made or removed. Set `ORCHARD_NO_HOOKS=1` to run none of them.
+A hook is a shell command in the config file. It runs with `sh -c`, so it can hold a pipe, and its arguments arrive as `$1`, `$2` and so on. A hook that fails is reported and otherwise ignored: it never stops a tree being made or removed. The one exception is `pre_remove`, whose whole job is to stop a removal. Set `ORCHARD_NO_HOOKS=1` to run none of them, `pre_remove` included.
 
 | Hook | When | Arguments |
 |---|---|---|
 | `hook.post_create` | After `new`, `n` or `t` makes a tree and copies its files in. | `$1` the tree, `$2` the repo's main checkout, `$3` the name |
+| `hook.pre_remove` | Before `rm` or the picker's `x` removes a tree, after the dirty check and before the confirm. A nonzero exit refuses the removal, and its output is shown as the reason. `rm -f` overrides it. Not run for a missing tree, which only prunes metadata. | `$1` the tree, `$2` the main checkout, `$3` the name |
 | `hook.post_remove` | After git removes a tree (or prunes a missing one), before the branch hint. | `$1` the tree's path, symlinks resolved, `$2` the main checkout, `$3` the name |
 | `hook.picker_start` | Once, in the background, as the picker opens. Output is discarded. | `$1` a cache directory shared with `preview` |
 | `hook.preview` | Every time the picker draws a preview. Its output is shown under the branch. | `$1` the tree or session directory, `$2` the preview width, `$3` the cache directory |
