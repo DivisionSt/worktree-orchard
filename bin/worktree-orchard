@@ -126,7 +126,7 @@ check_config() {
     case "$k" in
       '!bad') echo "$PROG: $CONFIG_FILE line ${line#*$'\037'} has no '=', so it was ignored" >&2 ;;
       code_root|worktree_dir|branch_prefix|default_agent|alt_agent|tmux|salvage|salvage_keep) ;;
-      hook.post_create|hook.post_remove|hook.picker_start|hook.preview) ;;
+      hook.post_create|hook.pre_remove|hook.post_remove|hook.picker_start|hook.preview) ;;
       agent.?*|creator.?*) ;;
       *) echo "$PROG: unknown key '$k' in $CONFIG_FILE, ignored" >&2 ;;
     esac
@@ -226,7 +226,8 @@ Usage: $PROG [-C <path>] [options]
                      whichever tool made it. Confirms first, refuses a dirty
                      tree or unpushed commits, saves gitignored work, and keeps
                      the branch. -f lifts a worktree lock first, which Claude
-                     Code holds for the life of a session
+                     Code holds for the life of a session, and overrides a
+                     pre_remove hook's refusal
   salvage            save what removing a worktree would destroy into the main
                      checkout's tmp/salvage/. See: $PROG salvage --help
 
@@ -272,7 +273,8 @@ Configuration lives in $CONFIG_FILE
 as key = value lines. Keys: code_root, worktree_dir, branch_prefix,
 default_agent, alt_agent, agent.<name>, tmux (auto, always, never), salvage
 (on, off), salvage_keep, creator.<label>, and the hooks hook.post_create,
-hook.post_remove, hook.picker_start and hook.preview. The README explains each.
+hook.pre_remove, hook.post_remove, hook.picker_start and hook.preview. The
+README explains each.
 
 Environment:
   ORCHARD_CONFIG            another config file
@@ -1140,6 +1142,26 @@ run_hook() {  # $1 hook name  [args...]
   return 0
 }
 
+# The one hook that can refuse. pre_remove runs before teardown's confirm, and
+# a nonzero exit stops the removal: a tool that knows a tree is still in use
+# (a coordinator with workers in other trees, say) can say so where the dirty
+# and lock checks already refuse. rm -f overrides it, as it overrides a lock,
+# and says so. Its output goes to the terminal, because it is the reason.
+pre_remove_refuses() {  # $1 path  $2 root  $3 name  $4 force: 1|0
+  local cmd rc=0
+  [ -z "${ORCHARD_NO_HOOKS:-}" ] || return 1
+  cmd=$(cfg hook.pre_remove)
+  [ -n "$cmd" ] || return 1
+  sh -c "$cmd" pre_remove "$1" "$2" "$3" >&2 || rc=$?
+  [ "$rc" = 0 ] && return 1
+  if [ "$4" = 1 ]; then
+    echo "$PROG: hook.pre_remove exited $rc; removing $3 anyway, as rm -f asked." >&2
+    return 1
+  fi
+  echo "$PROG: hook.pre_remove refused removing $3 (exit $rc). To remove it anyway: $PROG rm -f $3" >&2
+  return 0
+}
+
 # A directory the picker_start hook can fill and the preview hook can read.
 # The picker spawns a fresh preview for every row the cursor lands on, so
 # anything slow belongs in picker_start, which runs once, in the background,
@@ -1531,11 +1553,11 @@ rm_by_name() {  # $1 name  $2 force: 1|0
   if [ "$force" = 1 ] && worktree_locked "${key#tree:}" "$(field_for "$key" 11)" >/dev/null; then
     git -C "$(field_for "$key" 11)" worktree unlock "${key#tree:}" && echo "unlocked $name" >&2
   fi
-  teardown_row "$key"
+  teardown_row "$key" "$force"
 }
 
-teardown_row() {  # $1 key
-  local key=$1 path=${1#tree:} name sess dirty
+teardown_row() {  # $1 key  [$2 force: 1|0, from rm -f]
+  local key=$1 path=${1#tree:} force=${2:-0} name sess dirty
   case "$key" in
     sess:*)
       sess=${key#sess:}
@@ -1582,6 +1604,13 @@ teardown_row() {  # $1 key
   # one. The delete command is printed instead.
   if [ "$dirty" != clean ]; then
     echo "$PROG: $name has uncommitted changes ($dirty). Commit or discard them first." >&2
+    return 1
+  fi
+
+  # After the dirty check, so a tree that git itself would refuse is reported
+  # for that, and before the lock check, so rm -f's unlock never happens for
+  # a removal the hook stops.
+  if pre_remove_refuses "$path" "$root" "$name" "$force"; then
     return 1
   fi
 

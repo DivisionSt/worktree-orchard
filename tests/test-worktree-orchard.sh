@@ -582,6 +582,31 @@ ORCHARD_CONFIG="$WORK/conf-failhook" run "$R" new hookfail --none
 check "a failing hook does not fail the create" "$?" 0
 has "but it is reported" "$(cat "$WORK/err")" "hook.post_create exited 3"
 
+# pre_remove is the one hook that can refuse: a nonzero exit stops rm and the
+# picker's x, its output is the reason, and rm -f overrides it.
+printf 'hook.pre_remove = echo "busy: $3 at $1 in $2"; exit 4\n' > "$WORK/conf-guard"
+ORCHARD_CONFIG="$WORK/conf-guard" run "$R" new guarded --none
+GUARDED=$(cd "$R/.claude/worktrees/guarded" && pwd -P)
+ORCHARD_CONFIG="$WORK/conf-guard" STDIN_FILE="$WORK/yes" run "$R" rm guarded
+check "a pre_remove hook that exits nonzero fails the rm" "$?" 1
+[ -d "$GUARDED" ] && ok "and keeps the tree" || bad "and keeps the tree" "removed"
+has "its output is the reason, with the tree, main checkout and name" "$(cat "$WORK/err")" "busy: guarded at $R/.claude/worktrees/guarded in $R"
+has "the refusal names rm -f" "$(cat "$WORK/err")" "refused removing guarded (exit 4). To remove it anyway: worktree-orchard rm -f guarded"
+ORCHARD_CONFIG="$WORK/conf-guard" ORCHARD_NO_HOOKS=1 STDIN_FILE="$WORK/yes" run "$R" rm -f guarded 2>/dev/null; true
+ORCHARD_CONFIG="$WORK/conf-guard" run "$R" new guarded2 --none
+ORCHARD_CONFIG="$WORK/conf-guard" STDIN_FILE="$WORK/yes" run "$R" rm -f guarded2
+check "rm -f overrides it" "$?" 0
+[ ! -d "$R/.claude/worktrees/guarded2" ] && ok "and removes the tree" || bad "and removes the tree" "$(cat "$WORK/err")"
+has "and says it overrode the hook" "$(cat "$WORK/err")" "hook.pre_remove exited 4; removing guarded2 anyway"
+printf 'hook.pre_remove = exit 0\n' > "$WORK/conf-pass"
+ORCHARD_CONFIG="$WORK/conf-pass" run "$R" new passing --none
+ORCHARD_CONFIG="$WORK/conf-pass" STDIN_FILE="$WORK/yes" run "$R" rm passing
+[ ! -d "$R/.claude/worktrees/passing" ] && ok "a pre_remove hook that exits 0 lets rm proceed" || bad "a pre_remove hook that exits 0 lets rm proceed" "$(cat "$WORK/err")"
+ORCHARD_CONFIG="$WORK/conf-guard" run "$R" new quietguard --none
+ORCHARD_CONFIG="$WORK/conf-guard" ORCHARD_NO_HOOKS=1 STDIN_FILE="$WORK/yes" run "$R" rm quietguard
+[ ! -d "$R/.claude/worktrees/quietguard" ] && ok "ORCHARD_NO_HOOKS skips pre_remove too" || bad "ORCHARD_NO_HOOKS skips pre_remove too" "$(cat "$WORK/err")"
+case "$(cat "$WORK/err")" in *"unknown key"*) bad "hook.pre_remove is a known key" "$(cat "$WORK/err")" ;; *) ok "hook.pre_remove is a known key" ;; esac
+
 # === invoked under another name, and the salvage subcommand ===================
 # A symlink named wt is how most people will shorten it. Messages follow the
 # name it was run as, and the salvage script is found beside the real file.
